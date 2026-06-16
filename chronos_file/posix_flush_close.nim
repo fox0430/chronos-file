@@ -5,7 +5,25 @@ import std/[posix, typedthreads]
 from std/os import FilePermission
 
 import pkg/chronos
-import pkg/chronos/[osutils, oserrno, threadsync]
+import pkg/chronos/[osutils, oserrno]
+
+when not defined(nimdoc):
+  import pkg/chronos/threadsync
+else:
+  # Under `nim doc`, chronos 4.2.2's doc-stub branch omits
+  # `contains(PDispatcher, AsyncFD)`, which `threadsync` needs, so importing it
+  # fails to compile. Stub the few symbols we use for doc builds only.
+  # See also https://github.com/status-im/nim-chronos/pull/657
+  type
+    ThreadSignal = object
+    ThreadSignalPtr = ptr ThreadSignal
+  proc new(t: typedesc[ThreadSignalPtr]): Result[ThreadSignalPtr, string] = discard
+  proc close(signal: ThreadSignalPtr): Result[void, string] = discard
+  proc fireSync(
+    signal: ThreadSignalPtr, timeout = InfiniteDuration
+  ): Result[bool, string] = discard
+  proc wait(signal: ThreadSignalPtr): Future[void] {.
+    async: (raises: [AsyncError, CancelledError]).} = discard
 
 import common, posix_handle, posix_io
 
