@@ -7,7 +7,7 @@ license = "MIT"
 
 # Dependencies
 
-requires "nim >= 2.0.0"
+requires "nim >= 2.0.16"
 requires "chronos >= 4.2.0"
 
 # Tasks
