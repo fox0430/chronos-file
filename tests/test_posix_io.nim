@@ -886,7 +886,7 @@ suite "chronos_file: posix_io (read/write surface)":
     let path = tempPath(".txt")
     let f = openAsync(path, fmReadWrite)
     var ran = false
-    f.lines(line):
+    f.lines(_):
       ran = true
     check not ran
     # break stops the iteration mid-file; the position stays after the
