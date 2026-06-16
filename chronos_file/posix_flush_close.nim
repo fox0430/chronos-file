@@ -17,13 +17,22 @@ else:
   type
     ThreadSignal = object
     ThreadSignalPtr = ptr ThreadSignal
-  proc new(t: typedesc[ThreadSignalPtr]): Result[ThreadSignalPtr, string] = discard
-  proc close(signal: ThreadSignalPtr): Result[void, string] = discard
+
+  proc new(t: typedesc[ThreadSignalPtr]): Result[ThreadSignalPtr, string] =
+    discard
+
+  proc close(signal: ThreadSignalPtr): Result[void, string] =
+    discard
+
   proc fireSync(
-    signal: ThreadSignalPtr, timeout = InfiniteDuration
-  ): Result[bool, string] = discard
-  proc wait(signal: ThreadSignalPtr): Future[void] {.
-    async: (raises: [AsyncError, CancelledError]).} = discard
+      signal: ThreadSignalPtr, timeout = InfiniteDuration
+  ): Result[bool, string] =
+    discard
+
+  proc wait(
+      signal: ThreadSignalPtr
+  ): Future[void] {.async: (raises: [AsyncError, CancelledError]).} =
+    discard
 
 import common, posix_handle, posix_io
 
