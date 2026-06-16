@@ -13,4 +13,4 @@ requires "chronos >= 4.2.0"
 # Tasks
 
 task test, "Run the test suite":
-  exec "nim c -r --hints:off tests/test_chronos_file.nim"
+  exec "nim c -r tests/test_chronos_file.nim"
