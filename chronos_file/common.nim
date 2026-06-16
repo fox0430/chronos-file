@@ -126,7 +126,7 @@ proc newAsyncFileIncompleteError*(msg: string): ref AsyncFileIncompleteError =
 proc newAsyncFileLimitError*(msg: string): ref AsyncFileLimitError =
   (ref AsyncFileLimitError)(msg: msg)
 
-proc `=destroy`(f: var AsyncFileObj) =
+proc `=destroy`(f: AsyncFileObj) =
   ## Best-effort safety net for a forgotten `close`: release the descriptor
   ## (and, for non-seekable fds, its dispatcher registration). Prefer an
   ## explicit `close`/`closeWait`; do not rely on this. While a pipe/FIFO
