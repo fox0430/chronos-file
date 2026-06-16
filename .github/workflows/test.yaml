@@ -66,4 +66,4 @@ jobs:
 
     - name: Run unit test
       run: |
-        nimble test
+        nimble test -y
