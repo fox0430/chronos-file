@@ -400,6 +400,52 @@ proc readExactlyString*(
     have.inc(n)
   return data
 
+proc tryReadByte(f: AsyncFile): tuple[got: bool, b: byte] {.raises: [AsyncFileError].} =
+  ## Non-blocking single-byte read used only for `readLine`'s CR/LF
+  ## disambiguation on a non-seekable fd. Serves a pending pushback byte first
+  ## (logically already available), otherwise tries the descriptor exactly once.
+  ##
+  ## Self-contained "next logical byte" primitive: at its sole call site
+  ## (immediately after `readLine` read the CR via `await read(f, 1)`) the
+  ## pushback was already drained by that read and no descriptor read is in
+  ## flight, so the pushback and `readFut` guards below are never taken today —
+  ## they keep the primitive correct if it is ever reused elsewhere.
+  ##
+  ## Returns `got = false` when no byte is available right now — covering both
+  ## end of file *and*, crucially, EAGAIN (the next byte has not arrived yet).
+  ## `readLine` must NOT suspend to disambiguate a bare CR from CRLF: on an idle
+  ## stream (writer paused awaiting our reply) that would hang an already
+  ## complete CR-terminated line until more data or EOF, deadlocking line-based
+  ## protocols. So a not-yet-available next byte is reported the same as EOF and
+  ## the CR is taken as a bare-CR terminator. This mirrors the seekable path,
+  ## which peeks the read-ahead buffer and likewise returns the line when no next
+  ## byte follows. Nothing is consumed on `got = false`, so the logical position
+  ## is unchanged; on `got = true` `f.offset` is advanced for the byte read.
+  if f.pushback.len > 0:
+    result = (true, f.pushback[0])
+    f.pushback = f.pushback[1 ..^ 1]
+    return
+
+  if not f.readFut.isNil and not f.readFut.finished():
+    # A descriptor read is parked on the fd; do not steal the byte it is waiting
+    # for. Report "no byte now" so the CR is taken as a bare CR (same as EAGAIN),
+    # mirroring readInto's top-up guard.
+    return (false, 0'u8)
+
+  var b: byte
+  let res = handleEintr(posix.read(cint(f.fd), addr b, 1))
+  if res > 0:
+    f.offset.inc(res)
+    (true, b)
+  elif res == 0:
+    (false, 0'u8) # end of file
+  else:
+    let err = osLastError()
+    if err == oserrno.EAGAIN or err == oserrno.EWOULDBLOCK:
+      (false, 0'u8) # next byte not available yet — do not block; treat as bare CR
+    else:
+      raise newAsyncFileOsError(err, "read")
+
 proc readLine*(
     f: AsyncFile, limit = 0
 ): Future[Opt[string]] {.async: (raises: [AsyncFileError, CancelledError]).} =
@@ -425,10 +471,26 @@ proc readLine*(
   ## beyond the terminator in the descriptor — preserving streaming semantics
   ## and interleaving with the low-level `readBuffer`.
   ##
+  ## After a CR, the byte needed to tell CRLF from a bare CR is *peeked without
+  ## blocking* on a non-seekable fd: if it has not arrived yet, the CR is taken
+  ## as a bare-CR terminator and the completed line is returned immediately,
+  ## rather than suspending until more data or EOF (which would hang a finished
+  ## line on an idle stream and deadlock line-based request/response protocols).
+  ## The trade-off is that a CRLF whose LF is delivered in a separate, delayed
+  ## read (CR and LF split across a stall) is read as a bare CR followed by an
+  ## empty line — but only in exactly the situations where the old behaviour
+  ## would have hung; when the next byte is already buffered (the common case,
+  ## e.g. the writer sent `\c\L` together) CRLF is still recognised as one
+  ## terminator.
+  ##
   ## If a mid-line read fails (or, on a non-seekable fd, is cancelled), the
   ## partial line accumulated so far is lost with the exception and the file
   ## position remains where reading stopped — i.e. in the middle of the line,
-  ## not at its start. The handle itself stays consistent and usable.
+  ## not at its start. The handle itself stays consistent and usable. An
+  ## *already complete* line is never lost this way: once its terminator has
+  ## been read, a failure of the post-CR peek (the read-ahead refill needed only
+  ## to tell CRLF from a bare CR) still returns the line, deferring the error to
+  ## the next call.
   checkOpen(f)
 
   var line = ""
@@ -444,11 +506,24 @@ proc readLine*(
       if ch == '\L':
         break
       if ch == '\c':
-        let nxt = await read(f, 1)
-        if nxt.len > 0 and char(nxt[0]) != '\L':
-          # Bare CR (not CRLF): un-read the following byte. Non-seekable, so
-          # fall back to a logical pushback that `read` re-serves.
-          f.pushback.add(nxt[0])
+        # Distinguish CRLF from a bare CR by peeking the next byte — but never
+        # block to do so. A blocking `await read` here would hang an already
+        # complete CR-terminated line on an idle stream until more data or EOF
+        # (see `tryReadByte`). `got = false` means EOF or the next byte has not
+        # arrived yet; either way the line is complete and the CR is a bare CR.
+        try:
+          let nxt = tryReadByte(f)
+          if nxt.got and char(nxt.b) != '\L':
+            # Bare CR (not CRLF): un-read the following byte. Non-seekable, so
+            # fall back to a logical pushback that `read` re-serves.
+            f.pushback.add(nxt.b)
+        except AsyncFileError:
+          # The peek needed to disambiguate CRLF from a bare CR failed with a
+          # real I/O error. The line is already complete (the CR terminated it),
+          # so return it now rather than losing it to the exception. The error
+          # resurfaces on the next call: tryReadByte left f.offset and pushback
+          # unchanged on failure.
+          return Opt.some(line)
         break
       if limit > 0 and line.len >= limit:
         # Un-read the over-limit byte so the position stays at the limit
@@ -480,7 +555,17 @@ proc readLine*(
       # Need the byte after CR to tell CRLF from a bare CR; refill if the CR
       # was the last buffered byte (it is already consumed, so this is safe).
       if f.rpos >= f.rbuf.len:
-        discard refillReadBuf(f, chunkSize)
+        try:
+          discard refillReadBuf(f, chunkSize)
+        except AsyncFileError:
+          # The peek's pread failed with a real I/O error (not EOF). The line is
+          # already complete — the CR terminated it — so do not lose it to the
+          # exception. Return it now; the error resurfaces on the next call,
+          # which re-attempts the refill from the post-CR position (refill left
+          # rbuf empty and the offset unchanged, so no byte is skipped or
+          # re-read). Mirrors the bare-CR-at-EOF case: an un-peekable next byte
+          # still leaves a complete line.
+          return Opt.some(line)
       if f.rpos < f.rbuf.len and char(f.rbuf[f.rpos]) == '\L':
         inc f.rpos # CRLF: consume the LF
       # else bare CR (or EOF): leave the peeked byte unconsumed for next call.
