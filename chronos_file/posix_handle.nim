@@ -145,18 +145,20 @@ proc setFileSize*(f: AsyncFile, length: int64) {.raises: [AsyncFileError].} =
 
 proc newAsyncFile*(fd: AsyncFD): AsyncFile {.raises: [AsyncFileError].} =
   ## Wraps an already open file descriptor. For non-seekable descriptors
-  ## (pipe/FIFO/tty) `O_NONBLOCK` is set automatically (best-effort: only if
-  ## `fcntl(F_GETFL)` succeeded), so that read/write take the EAGAIN ->
-  ## `addReader2` path instead of blocking the event loop. Regular files are
-  ## unaffected by the flag.
+  ## (pipe/FIFO/tty) `O_NONBLOCK` is set automatically so that read/write take
+  ## the EAGAIN -> `addReader2` path instead of blocking the event loop; if the
+  ## flag cannot be set this proc raises (a blocking non-seekable fd would stall
+  ## the whole loop, so the failure is fatal, not ignored). Regular files bypass
+  ## the dispatcher and are unaffected by the flag.
   ##
   ## Ownership: on success the returned `AsyncFile` takes over `fd`, and a later
   ## `close()` will close it (so do not also close `fd` yourself). If this proc
-  ## raises instead (e.g. registration or `fstat` fails), `fd` is left open and
-  ## ownership stays with the caller. Note, however, that the flag changes below
-  ## (`O_NONBLOCK` on non-seekable fds, `FD_CLOEXEC`) are applied to `fd` *before*
-  ## the operations that can raise, and are **not** rolled back on failure — a
-  ## fd handed back to the caller after a raise may already carry them.
+  ## raises instead (e.g. making the fd non-blocking, registration or `fstat`
+  ## fails), `fd` is left open and ownership stays with the caller. Note,
+  ## however, that the flag changes below (`O_NONBLOCK` on non-seekable fds,
+  ## `FD_CLOEXEC`) are applied to `fd` *before* the operations that can raise,
+  ## and are **not** rolled back on failure — a fd handed back to the caller
+  ## after a raise may already carry them.
   ##
   ## `O_APPEND` is detected via `fcntl`, so positioned writes (`writeAt`/
   ## `writeBufferAt`) are rejected on append-mode descriptors exactly as for a
@@ -185,10 +187,19 @@ proc newAsyncFile*(fd: AsyncFD): AsyncFile {.raises: [AsyncFileError].} =
   # Seekable fds bypass the dispatcher, so only register non-seekable ones
   # (close mirrors this and only unregisters non-seekable fds).
   if not seekable:
-    # Non-seekable fds must be non-blocking, otherwise read/write would block
+    # Non-seekable fds MUST be non-blocking, otherwise read/write would block
     # the whole event loop instead of returning EAGAIN and taking the
-    # addReader2/addWriter2 path. Best-effort via chronos' helper.
-    discard setDescriptorBlocking(cint(fd), false)
+    # addReader2/addWriter2 path. Unlike openAsync (which sets O_NONBLOCK
+    # atomically in the open() flags), here the flag is toggled on an existing
+    # fd, so it can fail — and a failure is fatal: registering a still-blocking
+    # fd would silently produce a handle that stalls the loop. Done before
+    # register2, so raising here needs no unregister, and `result` is still nil
+    # (no half-built handle for the destructor to touch); the caller keeps fd
+    # ownership. On F_GETFL/F_SETFL failure the helper leaves the fd flags
+    # unchanged, so no O_NONBLOCK rollback is owed.
+    let nonblock = setDescriptorBlocking(cint(fd), false)
+    if nonblock.isErr:
+      raise newAsyncFileOsError(nonblock.error, "newAsyncFile")
     let res = register2(fd)
     if res.isErr:
       raise newAsyncFileOsError(res.error, "newAsyncFile")
