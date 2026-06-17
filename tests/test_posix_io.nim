@@ -121,6 +121,38 @@ suite "chronos_file: posix_io (read/write surface)":
     f.close()
     removeFile(path)
 
+  asyncTest "readLine handles a bare CR ending exactly at a read-ahead chunk boundary":
+    # The read-ahead chunk is 4096 bytes. A bare CR as the very last byte of a
+    # chunk forces readLine to refill (pread the next chunk) purely to peek the
+    # byte after the CR. Here the next chunk is EOF, so the line is complete and
+    # must be returned — exercising the post-CR refill branch that now also
+    # guards against losing a completed line if that peek pread fails.
+    let path = tempPath(".txt")
+    let f = openAsync(path, fmReadWrite)
+    let body = "a".repeat(4095) # 4095 + the CR = exactly one 4096-byte chunk
+    await f.write(body & "\r")
+    f.setFilePos(0)
+    check (await f.readLine()) == Opt.some(body) # bare CR at the chunk/EOF edge
+    check (await f.readLine()).isNone()
+    check f.getFilePos() == 4096 # positioned right after the consumed CR
+    f.close()
+    removeFile(path)
+
+  asyncTest "readLine recognises a CRLF split across a read-ahead chunk boundary":
+    # CR is the last byte of chunk 1; its LF is the first byte of chunk 2. The
+    # post-CR refill must fetch chunk 2 and recognise the CRLF as one terminator,
+    # not emit a spurious empty line for the LF.
+    let path = tempPath(".txt")
+    let f = openAsync(path, fmReadWrite)
+    let body = "a".repeat(4095) # CR lands at byte 4095 (last of chunk 1)
+    await f.write(body & "\r\ntail") # LF is byte 4096 (first of chunk 2)
+    f.setFilePos(0)
+    check (await f.readLine()) == Opt.some(body) # CRLF spanning the boundary
+    check (await f.readLine()) == Opt.some("tail") # next line, no spurious "" first
+    check (await f.readLine()).isNone()
+    f.close()
+    removeFile(path)
+
   asyncTest "large file across multiple chunks (>4KB)":
     let path = tempPath(".bin")
     let f = openAsync(path, fmReadWrite)
@@ -244,6 +276,85 @@ suite "chronos_file: posix_io (read/write surface)":
     check (await r.readLine()).isNone()
     r.close()
     removeFile(path)
+
+  asyncTest "readLine returns a bare-CR line on an idle stream without blocking":
+    # Regression: a CR-terminated line on a non-seekable fd must not block waiting
+    # for the byte after the CR (needed to tell CRLF from a bare CR). The writer
+    # sends "hello\r" and then pauses — neither appends nor closes — as a
+    # line-based request/response peer would while awaiting our reply. readLine
+    # must return the already-complete "hello" now (peeking the next byte
+    # non-blockingly), not suspend on addReader2 until more data or EOF.
+    let path = tempPath(".fifo")
+    check mkfifo(cstring(path), Mode(0o600)) == 0
+    let r = openAsync(path, fmRead)
+    let w = openAsync(path, fmWrite)
+    await w.write("hello\r") # no LF, no close: the stream is now idle
+    let lf = r.readLine()
+    check lf.finished() # completed synchronously — no suspension on the CR peek
+    check (await lf) == Opt.some("hello")
+    # The stream is still open, and a CRLF delivered together is still one line.
+    await w.write("world\r\n")
+    check (await r.readLine()) == Opt.some("world")
+    w.close()
+    check (await r.readLine()).isNone()
+    r.close()
+    removeFile(path)
+
+  asyncTest "readLine returns a completed bare-CR line when the non-seekable peek fails":
+    # Construct a non-seekable handle whose only available byte is a CR in the
+    # readLine pushback. The post-CR peek then hits a broken fd (EBADF). The
+    # completed line must be returned, and the error must resurface on the next
+    # readLine.
+    var f = AsyncFile(
+      fd: AsyncFD(cint(-1)),
+      offset: 0,
+      seekable: false,
+      opened: true,
+      pushback: @[byte '\r'],
+    )
+    try:
+      check (await f.readLine()) == Opt.some("")
+      var failed = false
+      try:
+        discard await f.readLine()
+      except AsyncFileOsError:
+        failed = true
+      check failed
+    finally:
+      # Always clear `opened` before the handle is destroyed: were a regression
+      # to make the first readLine raise instead, an unwinding destructor would
+      # unregister2/closeFd the invalid fd (and unregistering an fd that was
+      # never registered aborts in the dispatcher), masking the test failure.
+      f.opened = false
+
+  asyncTest "readLine returns a completed bare-CR line when the seekable peek pread fails":
+    # Construct a seekable handle with a full chunk whose last byte is a CR.
+    # The fd is invalid, so the post-CR refill (the peek needed to tell CRLF
+    # from a bare CR) fails with EBADF. The completed line must still be
+    # returned, and the error must resurface on the next call.
+    let body = "a".repeat(4095)
+    var f = AsyncFile(
+      fd: AsyncFD(cint(-1)),
+      offset: 4096,
+      seekable: true,
+      opened: true,
+      rbuf: (body & "\r").toBytes,
+      rpos: 0,
+    )
+    try:
+      check (await f.readLine()) == Opt.some(body)
+      var failed = false
+      try:
+        discard await f.readLine()
+      except AsyncFileOsError:
+        failed = true
+      check failed
+    finally:
+      # Always clear `opened` before the handle is destroyed (see the
+      # non-seekable peek-failure test): a regression that raised on the first
+      # readLine would otherwise let the destructor closeFd the invalid fd while
+      # unwinding, masking the failure.
+      f.opened = false
 
   asyncTest "readAt / writeAt do not disturb the file position":
     let path = tempPath(".bin")
