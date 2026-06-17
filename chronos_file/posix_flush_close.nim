@@ -1,7 +1,7 @@
 ## Durability (`flush` via a worker thread), teardown (`close`/`closeWait`) and
 ## the one-shot file helpers built on the rest of the API.
 
-import std/[posix, typedthreads]
+import std/[atomics, posix, typedthreads]
 from std/os import FilePermission
 
 import pkg/chronos
@@ -40,20 +40,35 @@ import common, posix_handle, posix_io
 
 type FlushCtx = object
   ## State shared between `flush` and its worker thread. Holds no GC-managed
-  ## fields, so a `ptr` to it may cross threads. Owned by `flush` (it lives in
-  ## the async proc's environment, which `noCancel` keeps alive to completion);
-  ## the worker never touches it again after firing the signal.
+  ## fields, so a `ptr` to it may cross threads. Owned by `flush`: it lives in
+  ## the async proc's environment, which `noCancel` keeps alive until `flush`
+  ## returns (after it has `joinThread`-ed the worker). The worker may therefore
+  ## keep writing `ctx` for its whole lifetime — up to and including the final
+  ## `exited` store — even after firing the completion signal.
   signal: ThreadSignalPtr
   fd: cint ## dup of the file's descriptor; closed by the worker when done.
   dataOnly: bool
   errCode: int32 ## errno of a failed sync, or 0 on success.
+  exited: Atomic[bool]
+    ## Set to `true` with `moRelease` by the worker as its very last action,
+    ## immediately before it returns. The watchdog loads it with `moAcquire`, so
+    ## observing `true` synchronises-with the final `errCode` and closed-fd
+    ## state. Because the worker only ever sets it last, `exited == true` already
+    ## implies the thread has fully run — an unscheduled or still-running worker
+    ## leaves it at its `false` zero value — so no separate "has it started yet?"
+    ## flag is needed. Replaces `running(thr[])` to avoid relying on the
+    ## implementation-defined memory semantics of `std/typedthreads`.
 
-proc flushWorker(ctx: ptr FlushCtx) {.thread.} =
-  ## Runs the blocking fsync/fdatasync off the event loop. Settles the ctx
-  ## (errCode), returns the dup'd fd and fires the signal — strictly in that
-  ## order, so when the loop side wakes up the result is final and no fd is
-  ## left behind. Must not touch `ctx` after `fireSync`: from that point the
-  ## loop side may already have freed it.
+const workerPollInterval = 10.milliseconds
+  ## Backstop cadence for noticing that the flush worker has exited when its
+  ## completion signal never arrives. Only the pathological all-`fireSync`-failed
+  ## path ever waits on this; the healthy path wakes on the signal instead.
+
+proc settleFlushSync(ctx: ptr FlushCtx) =
+  ## Runs the blocking fsync/fdatasync, records the resulting errno in
+  ## `ctx.errCode` (0 on success) and closes the dup'd fd. Factored out of
+  ## `flushWorker` so the backstop test can reuse the exact same settle logic in
+  ## a stand-in worker that deliberately never fires the completion signal.
   let res =
     when defined(linux) or defined(android) or defined(freebsd) or defined(netbsd):
       if ctx.dataOnly:
@@ -72,16 +87,78 @@ proc flushWorker(ctx: ptr FlushCtx) {.thread.} =
       0
   discard closeFd(ctx.fd)
 
+proc flushWorker(ctx: ptr FlushCtx) {.thread.} =
+  ## Runs the blocking fsync/fdatasync off the event loop. Settles the ctx
+  ## (errCode), returns the dup'd fd, fires the completion signal and finally
+  ## publishes `exited` — in that order, so when the loop side wakes up the
+  ## result is final and no fd is left behind. `ctx` stays valid for the whole
+  ## of this proc: `flush` keeps it alive (via `noCancel`) until after it has
+  ## `joinThread`-ed this worker, so writing `ctx.exited` after `fireSync` is
+  ## safe even though the loop side may already have woken on the signal.
+  settleFlushSync(ctx)
+
   for _ in 0 ..< 3:
-    # A lost signal would leave `flush` suspended forever — a Future cannot be
-    # failed from a foreign thread, and the loop side waits unconditionally
-    # (`noCancel`). `fireSync` already blocks internally on a full signal pipe,
-    # so an error here is exceptional (EBADF-class); retry a few times as a
-    # best-effort mitigation rather than giving up on the first failure. After
-    # a successful fire `ctx` must not be touched again (the loop side may have
-    # freed it) — the immediate `break` guarantees that.
+    # Fire the completion signal so the loop side wakes promptly. A Future cannot
+    # be failed from a foreign thread, so this is the only event-driven wakeup;
+    # `fireSync` already blocks internally on a full signal pipe, so an error here
+    # is exceptional (EBADF-class). Retry a few times as a best-effort mitigation.
+    # A signal lost despite all retries no longer hangs `flush`: the loop side
+    # also polls this thread's liveness as a backstop (see `awaitFlushWorker`),
+    # and the worker has already settled `ctx.errCode` above. Firing still matters
+    # because it keeps the common path event-driven rather than waiting out a poll
+    # interval. The `break` stops after the first success so we never fire twice;
+    # the only `ctx` access after a successful fire is the `exited` store below,
+    # which is safe (see this proc's docstring).
     if ctx.signal.fireSync().isOk():
       break
+  # Publish thread exit. `ctx` remains valid until `flush` returns (it is a
+  # local variable kept alive by `noCancel`), so this store is safe even after
+  # a successful `fireSync`.
+  ctx.exited.store(true, moRelease)
+
+proc pollWorkerExit(
+    ctx: ptr FlushCtx
+): Future[void] {.async: (raises: [CancelledError]).} =
+  ## Completes once the worker thread has returned. The worker sets `ctx.exited`
+  ## with `moRelease` as its very last action, so loading it with `moAcquire`
+  ## synchronises-with the final `errCode` and closed-fd state — independently
+  ## of whether it managed to fire the completion signal. An unscheduled or
+  ## still-running worker leaves `exited` at its `false` zero value, so polling
+  ## it alone never mistakes "not finished yet" for "already exited".
+  while not ctx.exited.load(moAcquire):
+    await sleepAsync(workerPollInterval)
+
+proc awaitFlushWorker(
+    ctx: ptr FlushCtx, signal: ThreadSignalPtr
+): Future[void] {.async: (raises: []).} =
+  ## Suspend until the flush worker has finished, leaving it ready to be joined.
+  ## The worker fires `signal` after settling the result and closing the dup fd,
+  ## so the healthy wakeup is event-driven and prompt. As a backstop for the
+  ## pathological case where every `fireSync` fails — the signal is never
+  ## delivered and `signal.wait()` would otherwise block forever — race the wait
+  ## against a watchdog that polls the worker's liveness directly.
+  ##
+  ## Never raises and never fails the flush on a wakeup error: the worker always
+  ## settles its result in `ctx`, so a signal/registration hiccup is irrelevant
+  ## once the thread has stopped running. Cancellation is deferred (the fsync
+  ## cannot be aborted), which is why every await here is either wrapped in
+  ## `noCancel` or operates on an `OwnCancelSchedule` future (the final
+  ## `cancelAndWait` calls).
+  let
+    signalWait = signal.wait()
+    watchdog = pollWorkerExit(ctx)
+  discard await noCancel(race(FutureBase(signalWait), FutureBase(watchdog)))
+  if not signalWait.completed():
+    # The wakeup came from the watchdog (worker already exited) or from a
+    # *failed* `signal.wait()` (e.g. an event-fd registration/read error, which
+    # can fire while the fsync is still running). Wait for the watchdog to
+    # observe the worker exit so the caller's `joinThread` only reaps it and
+    # never blocks the event loop on a still-running fsync.
+    await noCancel(watchdog)
+  # Tear down both arms; whichever already finished is a no-op. Cancelling the
+  # signal wait removes its event-fd reader before the caller closes the signal.
+  await signalWait.cancelAndWait()
+  await watchdog.cancelAndWait()
 
 proc flush*(
     f: AsyncFile, kind = flushFull
@@ -102,6 +179,12 @@ proc flush*(
   ## this future does not detach it — cancellation is deferred (`noCancel`)
   ## and the future settles only once the sync finishes. `CancelledError` is
   ## therefore never raised.
+  ##
+  ## **Signal backstop:** the worker tries to fire a completion signal so the
+  ## event loop wakes promptly. If signal registration, delivery or waiting fails
+  ## for any reason, `flush` does not raise an error for that — the worker's
+  ## result is still collected once the thread exits, and any actual sync failure
+  ## is reported as an `AsyncFileError` from `ctx.errCode`.
   ##
   ## **Platform note:** `fdatasync` only exists on Linux/Android and the BSDs
   ## that provide it. On macOS (and other platforms lacking it) `flushDataOnly`
@@ -128,8 +211,9 @@ proc flush*(
     discard closeFd(dupFd)
     raise newAsyncFileError("flush: cannot create completion signal: " & error)
 
-  # `ctx` and `thr` live in this proc's environment; `noCancel` below
-  # guarantees the proc runs to completion, so both outlive the worker.
+  # `ctx` and `thr` live in this proc's environment. `awaitFlushWorker` defers
+  # cancellation internally with `noCancel`, so this proc runs to completion and
+  # both outlive the worker.
   var ctx = FlushCtx(signal: signal, fd: dupFd, dataOnly: kind == flushDataOnly)
   var thr: Thread[ptr FlushCtx]
   try:
@@ -138,18 +222,18 @@ proc flush*(
     discard closeFd(dupFd)
     discard signal.close()
     raise newAsyncFileError("flush: cannot create worker thread: " & e.msg)
-  try:
-    await noCancel(signal.wait())
-  except AsyncError as e:
-    raise newAsyncFileError("flush: wait on completion signal failed: " & e.msg)
-  finally:
-    # The worker fires the signal as its last action, so on the normal path it
-    # is already exiting and the join takes microseconds. Only if the wait
-    # itself failed can this block until the sync finishes (rare; accepted).
-    joinThread(thr)
-    # Closing the signal unregisters its event fd from this thread's
-    # dispatcher, so it must happen here on the loop thread, not in the worker.
-    discard signal.close()
+  # Wait for the worker to finish: event-driven on the completion signal, with a
+  # liveness-poll backstop so a never-delivered signal can't hang us. This never
+  # raises and defers cancellation, so the worker is always reaped and the signal
+  # always closed below — no fd/thread leak even if every `fireSync` failed.
+  await awaitFlushWorker(addr ctx, signal)
+  # The worker has either fired the signal (after the fsync is complete) or been
+  # observed exited by the watchdog. `joinThread` here reaps the thread; it never
+  # blocks the loop on a still-running fsync.
+  joinThread(thr)
+  # Closing the signal unregisters its event fd from this thread's dispatcher, so
+  # it must happen here on the loop thread, not in the worker.
+  discard signal.close()
 
   if ctx.errCode != 0:
     raise newAsyncFileOsError(OSErrorCode(ctx.errCode), "flush")

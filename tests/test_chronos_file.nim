@@ -10,4 +10,6 @@
 # UnusedImport warning is expected here and silenced.
 {.warning[UnusedImport]: off.}
 
-import test_posix_handle, test_posix_io, test_posix_flush_close, test_common
+import
+  test_posix_handle, test_posix_io, test_posix_flush_close, test_common,
+  test_flush_backstop
