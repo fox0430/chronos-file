@@ -115,16 +115,6 @@ proc doWrite*(
     raise newAsyncFileOsError(oserrno.EIO, context)
   res
 
-proc doPwriteAll*(
-    fd: cint, buf: pointer, size: int, off: int64, context = ""
-) {.raises: [AsyncFileError].} =
-  ## Writes exactly `size` bytes via `pwrite`, handling partial writes. Used by
-  ## positioned writes, which do not track `f.offset`.
-  var written = 0
-  while written < size:
-    let p = cast[pointer](cast[uint](buf) + uint(written))
-    written.inc(doPwrite(fd, p, size - written, off + int64(written), context))
-
 proc blockDeviceSize*(fd: cint): int64 {.raises: [AsyncFileError].} =
   ## Real byte size of a block device. `fstat` reports `st_size == 0` for block
   ## devices, so query the kernel via `ioctl`. On platforms without a known
