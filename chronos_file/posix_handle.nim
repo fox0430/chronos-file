@@ -63,19 +63,62 @@ proc reconcile*(f: AsyncFile) =
   f.rbuf.setLen(0)
   f.rpos = 0
 
-proc refillReadBuf*(f: AsyncFile, chunkSize: int): bool {.raises: [AsyncFileError].} =
-  ## Refills `f.rbuf` in place with a fresh chunk pread at `f.offset` (rpos = 0),
-  ## advancing `f.offset` by the bytes read. Returns false at EOF (rbuf left
-  ## empty). Seekable `readLine` helper; only called once the previous buffer is
-  ## exhausted (rpos == rbuf.len), so overwriting `rbuf` drops no unconsumed bytes.
-  ## Reuses the existing `rbuf` allocation across refills (setLen up to the chunk
-  ## then down to the bytes read keeps the capacity), so successive readLines do
-  ## not reallocate a 4 KiB buffer per refill.
+proc readSeekable*(
+    f: AsyncFile, buf: pointer, size: int, offset: int64, context = ""
+): Future[int] {.async: (raises: [AsyncFileError]).} =
+  ## The single async seam for a *seekable* read: one `pread` of up to `size`
+  ## bytes into `buf` at the absolute `offset`, returning the bytes read
+  ## (0 = EOF).
+  ##
+  ## Offset-agnostic — it never touches `f.offset`; the caller owns all offset
+  ## bookkeeping. Every seekable read in the library funnels through here
+  ## (`readBuffer`/`readBufferAt` and `readLine`'s read-ahead refill), so this is
+  ## the one place to later swap the synchronous `pread` for an io_uring
+  ## submission.
+  ##
+  ## Today it issues the syscall inline and completes immediately, so the
+  ## returned future is already finished when this returns: awaiting it does not
+  ## suspend the caller (chronos resumes synchronously past an already-finished
+  ## future), which preserves the invariant that seekable I/O never yields to the
+  ## dispatcher.
+  return doPread(cint(f.fd), buf, size, offset, context)
+
+proc writeSeekable*(
+    f: AsyncFile, buf: pointer, size: int, offset: int64, context = ""
+): Future[int] {.async: (raises: [AsyncFileError]).} =
+  ## The single async seam for a *seekable* write: one write of up to `size`
+  ## bytes from `buf`, returning the bytes written (> 0).
+  ##
+  ## Append-aware — under `fmAppend` it uses a sequential `write` (the kernel
+  ## appends atomically to the end of file, so `offset` is ignored; this is the
+  ## platform-independent append contract — `pwrite` would honour `offset` and
+  ## overwrite on POSIX-conforming platforms, appending only on Linux),
+  ## otherwise a `pwrite` at the absolute `offset`. Offset-agnostic: it never
+  ## touches `f.offset`, so the caller drives the partial-write loop and offset
+  ## bookkeeping. The companion of `readSeekable` and, like it, the one place to
+  ## later swap the synchronous syscall for an io_uring submission; today it
+  ## completes immediately, so awaiting it does not suspend the caller.
+  if f.appendMode:
+    return doWrite(cint(f.fd), buf, size, context)
+  else:
+    return doPwrite(cint(f.fd), buf, size, offset, context)
+
+proc refillReadBuf*(
+    f: AsyncFile, chunkSize: int
+): Future[bool] {.async: (raises: [AsyncFileError, CancelledError]).} =
+  ## Refills `f.rbuf` in place with a fresh chunk read at `f.offset` (rpos = 0)
+  ## through the `readSeekable` seam, advancing `f.offset` by the bytes read.
+  ## Returns false at EOF (rbuf left empty). Seekable `readLine` helper; only
+  ## called once the previous buffer is exhausted (rpos == rbuf.len), so
+  ## overwriting `rbuf` drops no unconsumed bytes. Reuses the existing `rbuf`
+  ## allocation across refills (setLen up to the chunk then down to the bytes
+  ## read keeps the capacity), so successive readLines do not reallocate a 4 KiB
+  ## buffer per refill.
   f.rbuf.setLen(chunkSize)
 
   let n =
     try:
-      doPread(cint(f.fd), addr f.rbuf[0], chunkSize, f.offset, "readLine")
+      await readSeekable(f, addr f.rbuf[0], chunkSize, f.offset, "readLine")
     except AsyncFileError as e:
       # Drop the grown (zero-filled) buffer: leaving rbuf.len > rpos would
       # make readLine serve phantom zeros and getFilePos/reconcile drift.
@@ -87,7 +130,7 @@ proc refillReadBuf*(f: AsyncFile, chunkSize: int): bool {.raises: [AsyncFileErro
   f.offset.inc(n)
   f.rbuf.setLen(n)
   f.rpos = 0
-  n > 0
+  return n > 0
 
 proc getFileSize*(f: AsyncFile): int64 {.raises: [AsyncFileError].} =
   ## Returns the size of the file in bytes. The file position is not touched

@@ -6,9 +6,40 @@ import std/posix
 import pkg/chronos
 import pkg/chronos/[osutils, oserrno]
 
-import common, posix_backend, posix_handle
+import common, posix_handle
 
 {.push raises: [].}
+
+proc readBufferSeekable(
+    f: AsyncFile, buf: pointer, size: int
+): Future[int] {.async: (raises: [AsyncFileError, CancelledError]).} =
+  ## Seekable branch of `readBuffer`: drop any `readLine` read-ahead, read at the
+  ## tracked `f.offset` through the `readSeekable` seam, then advance the offset.
+  ## Split out so the raw `readBuffer` can `return` this future for seekable fds
+  ## while keeping its non-seekable EAGAIN/`addReader2` machinery inline. The seam
+  ## completes synchronously, so this never suspends or touches the dispatcher.
+  reconcile(f) # drop any readLine read-ahead so this read sees the logical pos
+  let n = await readSeekable(f, buf, size, f.offset, "read")
+  f.offset.inc(n)
+  return n
+
+proc writeBufferSeekable(
+    f: AsyncFile, buf: pointer, size: int
+): Future[void] {.async: (raises: [AsyncFileError, CancelledError]).} =
+  ## Seekable branch of `writeBuffer`: drop any `readLine` read-ahead, then write
+  ## the whole buffer through the append-aware `writeSeekable` seam one chunk at a
+  ## time, advancing `f.offset` per successful chunk so a mid-write error leaves
+  ## it consistent with the bytes actually written. Split out so the raw
+  ## `writeBuffer` can `return` this future for seekable fds while keeping its
+  ## non-seekable EAGAIN/`addWriter2` machinery inline. The seam completes
+  ## synchronously, so this never suspends or touches the dispatcher.
+  reconcile(f) # drop any readLine read-ahead so this write sees the logical pos
+  var written = 0
+  while written < size:
+    let p = cast[pointer](cast[uint](buf) + uint(written))
+    let res = await writeSeekable(f, p, size - written, f.offset, "write")
+    written.inc(res)
+    f.offset.inc(res)
 
 proc readBuffer*(
     f: AsyncFile, buf: pointer, size: int
@@ -19,9 +50,21 @@ proc readBuffer*(
   ##
   ## This is the low-level path and bypasses the `readLine` pushback buffer, so
   ## do not interleave `readBuffer` with `readLine` on the same file.
-  let retFuture = newFuture[int]("chronos_file.readBuffer")
-
   let uerr = usabilityError(f)
+
+  # Fast path: a usable, non-empty seekable read needs none of the raw-future
+  # machinery below, so delegate straight to the seam helper, which returns its
+  # own future. This keeps the regular-file hot path to a single future
+  # allocation (the helper's) instead of also allocating an unused `retFuture`
+  # here. Every other case (errors, empty reads, non-seekable fds) falls through
+  # and uses `retFuture`.
+  if uerr.isNil and size > 0 and f.seekable:
+    # Regular files / block devices: read at the tracked offset through the
+    # seekable seam. Never returns EAGAIN, so it completes synchronously without
+    # touching the dispatcher or the kernel file position.
+    return readBufferSeekable(f, buf, size)
+
+  let retFuture = newFuture[int]("chronos_file.readBuffer")
   if not uerr.isNil:
     retFuture.fail(uerr)
     return retFuture
@@ -35,19 +78,9 @@ proc readBuffer*(
     retFuture.complete(0)
     return retFuture
 
-  if f.seekable:
-    # Regular files / block devices: pread at the tracked offset. Never returns
-    # EAGAIN, so it completes synchronously without touching the dispatcher or
-    # the kernel file position.
-    reconcile(f) # drop any readLine read-ahead so this pread sees the logical pos
-    try:
-      let n = doPread(cint(f.fd), buf, size, f.offset, "read")
-      f.offset.inc(n)
-      retFuture.complete(n)
-    except AsyncFileError as e:
-      retFuture.fail(e)
-    return retFuture
-
+  # Only non-seekable fds (pipe/FIFO/tty) reach here: the fast path took every
+  # usable non-empty seekable read, and the guards above handled the seekable
+  # error/empty cases.
   if not f.readFut.isNil and not f.readFut.finished():
     # Only one read may wait on the descriptor at a time; a second concurrent
     # read would clobber the reader registration and `f.readFut` tracking.
@@ -112,9 +145,21 @@ proc writeBuffer*(
   ## Not atomic on non-seekable fds (pipe/FIFO/tty): if the write suspends on a
   ## full buffer and is then cancelled or fails, the bytes already accepted by
   ## the kernel stay written and `f.offset` reflects that partial progress.
-  let retFuture = newFuture[void]("chronos_file.writeBuffer")
-
   let uerr = usabilityError(f)
+
+  # Fast path (see readBuffer): a usable, non-empty seekable write delegates
+  # straight to the seam helper, which returns its own future, so the
+  # regular-file hot path allocates no unused `retFuture` here.
+  if uerr.isNil and size > 0 and f.seekable:
+    # Regular files / block devices: write at the tracked offset through the
+    # seekable seam — pwrite normally, or a sequential write() in append mode so
+    # the kernel picks the end of file (atomic append) on every platform (pwrite
+    # would only append on Linux and would overwrite at a stale offset on
+    # POSIX-conforming platforms). Completes synchronously; the seam is
+    # append-aware and the helper advances `f.offset` per successful chunk.
+    return writeBufferSeekable(f, buf, size)
+
+  let retFuture = newFuture[void]("chronos_file.writeBuffer")
   if not uerr.isNil:
     retFuture.fail(uerr)
     return retFuture
@@ -127,31 +172,7 @@ proc writeBuffer*(
     retFuture.complete()
     return retFuture
 
-  if f.seekable:
-    # Regular files / block devices: pwrite at the tracked offset — except in
-    # append mode, where a sequential write() lets the kernel pick the end of
-    # file (atomic append) on every platform; pwrite would only append on
-    # Linux (its documented O_APPEND quirk) and would overwrite at a stale
-    # offset on POSIX-conforming platforms (macOS/BSD). Completes
-    # synchronously. Advance `f.offset` per successful chunk so a mid-write
-    # error leaves it consistent with the bytes actually written.
-    reconcile(f) # drop any readLine read-ahead so this write sees the logical pos
-    try:
-      var written = 0
-      while written < size:
-        let p = cast[pointer](cast[uint](buf) + uint(written))
-        let res =
-          if f.appendMode:
-            doWrite(cint(f.fd), p, size - written, "write")
-          else:
-            doPwrite(cint(f.fd), p, size - written, f.offset, "write")
-        written.inc(res)
-        f.offset.inc(res)
-      retFuture.complete()
-    except AsyncFileError as e:
-      retFuture.fail(e)
-    return retFuture
-
+  # Only non-seekable fds reach here (see readBuffer's fast path).
   if not f.writeFut.isNil and not f.writeFut.finished():
     # Only one write may wait on the descriptor at a time.
     retFuture.fail(newAsyncFileBusyError("write already in progress"))
@@ -544,7 +565,7 @@ proc readLine*(
   var any = false
   while true:
     if f.rpos >= f.rbuf.len:
-      if not refillReadBuf(f, chunkSize):
+      if not await refillReadBuf(f, chunkSize):
         break # EOF: return whatever `line` accumulated
     let ch = char(f.rbuf[f.rpos])
     inc f.rpos
@@ -556,7 +577,7 @@ proc readLine*(
       # was the last buffered byte (it is already consumed, so this is safe).
       if f.rpos >= f.rbuf.len:
         try:
-          discard refillReadBuf(f, chunkSize)
+          discard await refillReadBuf(f, chunkSize)
         except AsyncFileError:
           # The peek's pread failed with a real I/O error (not EOF). The line is
           # already complete — the CR terminated it — so do not lose it to the
@@ -638,9 +659,16 @@ proc readBufferAt*(
   ## seekable fd every operation completes synchronously without yielding to the
   ## dispatcher, so distinct operations never actually overlap mid-flight — the
   ## real value here is offset-independence, not interleaving.
-  let retFuture = newFuture[int]("chronos_file.readBufferAt")
-
   let uerr = usabilityError(f)
+
+  # Fast path: a usable, non-empty positioned read is exactly the seam — a single
+  # seekable read at an explicit offset — so return its future directly (it never
+  # touches `f.offset`). No `retFuture` is allocated on this hot path; only the
+  # error/empty cases below need one.
+  if uerr.isNil and size > 0:
+    return readSeekable(f, buf, size, offset, "readAt")
+
+  let retFuture = newFuture[int]("chronos_file.readBufferAt")
   if not uerr.isNil:
     retFuture.fail(uerr)
     return retFuture
@@ -648,18 +676,13 @@ proc readBufferAt*(
     # See readBuffer: never let a negative size reach the syscall.
     retFuture.fail(newAsyncFileError("negative read size: " & $size))
     return retFuture
-  if size == 0:
-    retFuture.complete(0)
-    return retFuture
-  try:
-    retFuture.complete(doPread(cint(f.fd), buf, size, offset, "readAt"))
-  except AsyncFileError as e:
-    retFuture.fail(e)
+  # size == 0: a no-op positioned read.
+  retFuture.complete(0)
   return retFuture
 
 proc writeBufferAt*(
     f: AsyncFile, offset: int64, buf: pointer, size: int
-): Future[void] {.async: (raw: true, raises: [AsyncFileError]).} =
+): Future[void] {.async: (raises: [AsyncFileError, CancelledError]).} =
   ## Writes exactly `size` bytes from `buf` at absolute `offset`, without using
   ## or modifying the file position. Seekable files only. Not permitted on files
   ## opened with `fmAppend`: on Linux the kernel ignores `pwrite`'s offset under
@@ -670,37 +693,32 @@ proc writeBufferAt*(
   ## Argument order: `offset` comes first, consistent with the high-level
   ## `writeAt(f, offset, data)` (this is *not* the `pwrite(fd, buf, size,
   ## offset)` C order — `offset` leads in every `*At` proc).
-  let retFuture = newFuture[void]("chronos_file.writeBufferAt")
-
   let uerr = usabilityError(f)
   if not uerr.isNil:
-    retFuture.fail(uerr)
-    return retFuture
+    raise uerr
   if size < 0:
     # See readBuffer: never let a negative size reach the syscall.
-    retFuture.fail(newAsyncFileError("negative write size: " & $size))
-    return retFuture
+    raise newAsyncFileError("negative write size: " & $size)
   if size == 0:
     # A zero-byte positioned write touches nothing, so treat it as a no-op even
     # in append mode (consistent with the high-level writeAt, which returns
     # early on empty data before this proc is reached).
-    retFuture.complete()
-    return retFuture
+    return
   if f.appendMode:
-    retFuture.fail(
-      newAsyncFileError("positioned write is not allowed in append mode (fmAppend)")
-    )
-    return retFuture
+    raise newAsyncFileError("positioned write is not allowed in append mode (fmAppend)")
 
   # A positioned write may overwrite bytes held in readLine's read-ahead; drop
   # it so a later implicit read does not serve stale (pre-write) bytes.
   reconcile(f)
-  try:
-    doPwriteAll(cint(f.fd), buf, size, offset, "writeAt")
-    retFuture.complete()
-  except AsyncFileError as e:
-    retFuture.fail(e)
-  return retFuture
+  # Write the whole buffer through the seam one chunk at a time (handling partial
+  # writes), advancing the explicit offset only — `f.offset` is never touched.
+  # Append mode was rejected above, so the seam takes its `pwrite` path here.
+  var written = 0
+  while written < size:
+    let p = cast[pointer](cast[uint](buf) + uint(written))
+    written.inc(
+      await writeSeekable(f, p, size - written, offset + int64(written), "writeAt")
+    )
 
 proc readAt*(
     f: AsyncFile, offset: int64, size: int
