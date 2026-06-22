@@ -63,6 +63,59 @@ proc reconcile*(f: AsyncFile) =
   f.rbuf.setLen(0)
   f.rpos = 0
 
+proc checkOffsetIdle*(f: AsyncFile) {.raises: [AsyncFileBusyError].} =
+  ## Reject an op that mutates the shared offset / read-ahead (a direct `offset`
+  ## write or `reconcile`) while a seekable implicit-offset op holds the slot.
+  ## Unlike `acquireOffsetGuard` it does *not* take the slot: positioning ops
+  ## (`setFilePos`/`setFileSize`) and the positioned write (`writeBufferAt`) touch
+  ## that state synchronously with no seam await, so they only need turning away,
+  ## not to hold it. No-op for non-seekable fds; positioned reads
+  ## (`readAt`/`readBufferAt`) never touch the state and skip this.
+  if f.seekable and f.seekOpInFlight:
+    raise newAsyncFileBusyError(
+      "a seekable read/write/readLine is already in progress on this handle"
+    )
+
+proc acquireOffsetGuard*(f: AsyncFile) {.raises: [AsyncFileBusyError].} =
+  ## Take the single in-flight `offset` slot for a seekable implicit-offset op,
+  ## raising `AsyncFileBusyError` if one is already held (see `seekOpInFlight`).
+  ## No-op for non-seekable fds, which use the `readFut`/`writeFut` guards.
+  ## Prefer the `withOffsetGuard` template, which pairs this with
+  ## `releaseOffsetGuard` correctly (acquire before the `try`, release in
+  ## `finally`); these raw procs are exported only for the tests.
+  checkOffsetIdle(f)
+  if f.seekable:
+    f.seekOpInFlight = true
+
+proc releaseOffsetGuard*(f: AsyncFile) =
+  ## Releases the slot taken by `acquireOffsetGuard`. No-op for non-seekable fds.
+  if f.seekable:
+    f.seekOpInFlight = false
+
+template withOffsetGuard*(f: AsyncFile, alreadyGuarded: bool, body: untyped) =
+  ## Run `body` (a seekable implicit-offset op) holding the single `offset` slot
+  ## for its whole duration, releasing it on every exit (normal/`return`/raise).
+  ## Acquire is *outside* the `try`, so a busy reject releases nothing — the one
+  ## place the acquire-before-try pairing lives. See `acquireOffsetGuard`.
+  ##
+  ## `alreadyGuarded = true` neither takes nor releases the slot (the caller
+  ## already holds it for the whole op, e.g. a multi-chunk read whose leaf chunks
+  ## must not re-take it). A defaulted single template can't replace the two
+  ## overloads: Nim won't bind a trailing colon-block past a defaulted parameter.
+  if not alreadyGuarded:
+    acquireOffsetGuard(f)
+  try:
+    body
+  finally:
+    if not alreadyGuarded:
+      releaseOffsetGuard(f)
+
+template withOffsetGuard*(f: AsyncFile, body: untyped) =
+  ## The unconditional form of the three-argument template (`alreadyGuarded =
+  ## false`): for a leaf/op that always owns the slot for its whole duration.
+  ## See the three-argument overload for the acquire-before-try contract.
+  withOffsetGuard(f, false, body)
+
 proc readSeekable*(
     f: AsyncFile, buf: pointer, size: int, offset: int64, context = ""
 ): Future[int] {.async: (raises: [AsyncFileError]).} =
@@ -104,7 +157,7 @@ proc writeSeekable*(
     return doPwrite(cint(f.fd), buf, size, offset, context)
 
 proc refillReadBuf*(
-    f: AsyncFile, chunkSize: int
+    f: AsyncFile, chunkSize: int, alreadyGuarded: bool
 ): Future[bool] {.async: (raises: [AsyncFileError, CancelledError]).} =
   ## Refills `f.rbuf` in place with a fresh chunk read at `f.offset` (rpos = 0)
   ## through the `readSeekable` seam, advancing `f.offset` by the bytes read.
@@ -114,23 +167,29 @@ proc refillReadBuf*(
   ## allocation across refills (setLen up to the chunk then down to the bytes
   ## read keeps the capacity), so successive readLines do not reallocate a 4 KiB
   ## buffer per refill.
-  f.rbuf.setLen(chunkSize)
+  ##
+  ## Single-in-flight guard: `readLine` holds the `offset` slot once for the whole
+  ## line and calls this with `alreadyGuarded = true`, so a concurrent op is
+  ## rejected for the entire op (not just per refill — a per-refill guard would
+  ## leave a gap once the seam suspends). Standalone (false) it takes the slot.
+  withOffsetGuard(f, alreadyGuarded):
+    f.rbuf.setLen(chunkSize)
 
-  let n =
-    try:
-      await readSeekable(f, addr f.rbuf[0], chunkSize, f.offset, "readLine")
-    except AsyncFileError as e:
-      # Drop the grown (zero-filled) buffer: leaving rbuf.len > rpos would
-      # make readLine serve phantom zeros and getFilePos/reconcile drift.
-      # An empty buffer preserves the logical position.
-      f.rbuf.setLen(0)
-      f.rpos = 0
-      raise e
+    let n =
+      try:
+        await readSeekable(f, addr f.rbuf[0], chunkSize, f.offset, "readLine")
+      except AsyncFileError as e:
+        # Drop the grown (zero-filled) buffer: leaving rbuf.len > rpos would
+        # make readLine serve phantom zeros and getFilePos/reconcile drift.
+        # An empty buffer preserves the logical position.
+        f.rbuf.setLen(0)
+        f.rpos = 0
+        raise e
 
-  f.offset.inc(n)
-  f.rbuf.setLen(n)
-  f.rpos = 0
-  return n > 0
+    f.offset.inc(n)
+    f.rbuf.setLen(n)
+    f.rpos = 0
+    return n > 0
 
 proc getFileSize*(f: AsyncFile): int64 {.raises: [AsyncFileError].} =
   ## Returns the size of the file in bytes. The file position is not touched
@@ -160,10 +219,17 @@ proc getFilePos*(f: AsyncFile): int64 {.raises: [AsyncFileError].} =
 proc setFilePos*(f: AsyncFile, pos: int64) {.raises: [AsyncFileError].} =
   ## Sets the current file position. Any pending `readLine` pushback is dropped,
   ## since the new position invalidates it.
+  ##
+  ## On a seekable handle this rewrites the shared `offset` and drops the
+  ## read-ahead, so it raises `AsyncFileBusyError` while a seekable implicit-offset
+  ## op is in flight (repositioning under it would corrupt its bookkeeping). The
+  ## `pos` validation runs before that busy check, so an invalid position always
+  ## reports the deterministic argument error, never a transient busy error.
   checkOpen(f)
 
   if pos < 0:
     raise newAsyncFileError("negative file position: " & $pos)
+  checkOffsetIdle(f)
   if not f.seekable:
     # Non-seekable fds (pipe/FIFO/tty) use the kernel position; let `lseek`
     # report the real error (typically ESPIPE). This path never blocks, so
@@ -180,7 +246,12 @@ proc setFilePos*(f: AsyncFile, pos: int64) {.raises: [AsyncFileError].} =
 
 proc setFileSize*(f: AsyncFile, length: int64) {.raises: [AsyncFileError].} =
   ## Truncates or extends the file to `length` bytes.
+  ##
+  ## Invalidates the `readLine` read-ahead (via `reconcile`), which touches the
+  ## shared `offset`, so it raises `AsyncFileBusyError` while a seekable implicit-
+  ## offset op is in flight (same reason as `setFilePos`).
   checkOpen(f)
+  checkOffsetIdle(f)
   reconcile(f) # truncation/extension invalidates any readLine read-ahead
 
   if handleEintr(ftruncate(cint(f.fd), Off(length))) == -1:

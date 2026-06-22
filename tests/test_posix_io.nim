@@ -446,12 +446,8 @@ suite "chronos_file: posix_io (read/write surface)":
     let w = openAsync(path, fmWrite)
     let rfut1 = r.read(5)
     check not rfut1.finished()
-    var rejected = false
-    try:
+    expect(AsyncFileBusyError):
       discard await r.read(5)
-    except AsyncFileBusyError:
-      rejected = true
-    check rejected
     await w.write(@[byte 1, 2, 3, 4, 5])
     check (await rfut1) == @[byte 1, 2, 3, 4, 5]
     r.close()
@@ -603,12 +599,8 @@ suite "chronos_file: posix_io (read/write surface)":
     let big = newSeq[byte](2 * 1024 * 1024)
     let wfut1 = w.write(big)
     check not wfut1.finished()
-    var rejected = false
-    try:
+    expect(AsyncFileBusyError):
       await w.write(@[byte 1, 2, 3])
-    except AsyncFileBusyError:
-      rejected = true
-    check rejected
     await wfut1.cancelAndWait()
     r.close()
     w.close()
