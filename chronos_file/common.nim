@@ -146,6 +146,73 @@ proc newAsyncFileIncompleteError*(msg: string): ref AsyncFileIncompleteError =
 proc newAsyncFileLimitError*(msg: string): ref AsyncFileLimitError =
   (ref AsyncFileLimitError)(msg: msg)
 
+# io_uring (iori) error boundary
+# Groundwork for the planned io_uring backend. The seekable seam in
+# `posix_handle` will later `await` iori bridge futures of type
+# `Future[int32]`, which report failures in two shapes that must never escape
+# chronos-file's public API. Both are funneled through here:
+#   * a CQE result `< 0` is `-errno` and becomes `AsyncFileOsError` (carrying the
+#     `OSErrorCode`), matching the `doPread`/`doPwrite` contract;
+#   * a raw `IOError` (ring closed / SQ full) or `OSError` thrown when the op
+#     cannot even be queued becomes `AsyncFileError` / `AsyncFileOsError`.
+# Kept next to the error constructors and deliberately free of any iori import,
+# so it compiles and is tested before iori is a dependency (`IOError`/`OSError`
+# are stdlib types). If iori later reports typed errors the wrapper collapses to
+# just `uringResult` — but that is an iori-side change and is out of scope here.
+
+proc uringResult*(res: int32, context = ""): int {.raises: [AsyncFileOsError].} =
+  ## Translate an io_uring CQE result into chronos-file's contract: a negative
+  ## value is `-errno` and is raised as `AsyncFileOsError` (preserving the
+  ## `OSErrorCode`); a non-negative value is the byte count and is returned
+  ## unchanged. `context` prefixes the message with the operation name, exactly
+  ## as `doPread`/`doPwrite` do. Covers every CQE result iori can produce (an
+  ## `-errno`, which always fits an `OSErrorCode`, or a byte count) and is the
+  ## single place the `res < 0 -> newAsyncFileOsError(OSErrorCode(-res))` rule
+  ## lives.
+  ##
+  ## Cancellation is *not* decoded here: a low-level `-ECANCELED` is only how
+  ## iori settles its own bridge future, and the seam keeps the public future
+  ## pending and drives chronos cancellation instead, so it does not reach
+  ## this mapping in normal flow.
+  if res < 0:
+    # Negate in `int`, not `int32`: `-res` would overflow for `res == low(int32)`
+    # (`OverflowDefect`). Every real `-errno` is small and fits an `OSErrorCode`;
+    # widening just keeps the arithmetic defensive for an unreachable input.
+    raise newAsyncFileOsError(OSErrorCode(-res.int), context)
+  int(res)
+
+template mapUringErrors*(context: string, body: untyped): untyped =
+  ## Run `body` (typically an `await` on an iori bridge future followed by
+  ## `uringResult` decoding) with iori's internal failure types translated into
+  ## chronos-file's public hierarchy, so neither `IOError` nor `OSError` ever
+  ## leaks past the public API:
+  ##   * `OSError` -> `AsyncFileOsError` (its `errorCode` becomes the OSErrorCode);
+  ##   * `IOError`  -> `AsyncFileError` (no errno: an internal-state failure such
+  ##     as a closed ring or a full submission queue).
+  ## `AsyncFileError` (already in-contract, e.g. raised by `uringResult` inside
+  ## `body`) and `CancelledError` propagate untouched — they are caught by
+  ## neither branch, so this layer leaves the seam's cancellation handling alone.
+  ##
+  ## SQ-full backpressure is iori's responsibility, not a retry loop here:
+  ## matching on the message string would be brittle, would reorder submissions
+  ## and break linked chains. This layer only guarantees the failure is surfaced
+  ## in-contract.
+  try:
+    body
+  except OSError as osErr:
+    raise newAsyncFileOsError(OSErrorCode(osErr.errorCode), context)
+  except IOError as ioErr:
+    # Bind `context` once: it is a typed template parameter, so each textual use
+    # re-evaluates the argument expression (`context.len` and `context & ": "`
+    # would evaluate it twice).
+    let ctx = context
+    let prefix =
+      if ctx.len > 0:
+        ctx & ": "
+      else:
+        ""
+    raise newAsyncFileError(prefix & ioErr.msg)
+
 proc `=destroy`(f: AsyncFileObj) =
   ## Best-effort safety net for a forgotten `close`: release the descriptor
   ## (and, for non-seekable fds, its dispatcher registration). Prefer an
