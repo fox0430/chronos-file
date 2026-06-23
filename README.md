@@ -15,11 +15,22 @@ Asynchronous file I/O for [chronos](https://github.com/status-im/nim-chronos).
 - **Non-seekable fds (pipe / FIFO / tty)** take the truly async `read`/`write` +
   `EAGAIN` path. An fd that is neither seekable nor epoll-pollable opens fine, but
   the **first read/write** fails (e.g. `EPERM`), surfacing as `AsyncFileOsError`.
+- **One implicit-offset op at a time per handle.** `read`/`write`/`readLine` (and
+  the low-level `readBuffer`/`writeBuffer`) all advance the shared file position,
+  so a second one issued while another is in flight raises `AsyncFileBusyError`.
+  For concurrent reads on a single handle use the positioned `readAt`/`readBufferAt`
+  family: it is offset-independent, touches no shared state and is never rejected.
+  The positioned *writes* (`writeAt`/`writeBufferAt`) and the positioning ops
+  (`setFilePos`/`setFileSize`) must drop the `readLine` read-ahead, which touches
+  the shared offset, so they too raise `AsyncFileBusyError` while an implicit-offset
+  op is in flight. (On non-seekable fds the same error guards against a second
+  concurrent `read`, or a second `write`.)
 - **Close explicitly** with `close()` (sync) or `closeWait()` (async). A
   destructor releases the fd as a last-resort safety net, but it does not cancel
   pending ops — never drop a handle to the GC while a pipe/FIFO read/write is in
-  flight. `closeWait()` cancels and drains in-flight ops so the awaiter sees
-  `CancelledError` rather than `EBADF`.
+  flight. `closeWait()` cancels and drains the in-flight pipe/FIFO op so the
+  awaiter sees `CancelledError` rather than `EBADF`. (Seekable file reads/writes
+  complete synchronously today, so none are ever pending at close.)
 
 ## Usage
 

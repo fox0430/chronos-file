@@ -11,17 +11,22 @@ import common, posix_handle
 {.push raises: [].}
 
 proc readBufferSeekable(
-    f: AsyncFile, buf: pointer, size: int
+    f: AsyncFile, buf: pointer, size: int, alreadyGuarded: bool
 ): Future[int] {.async: (raises: [AsyncFileError, CancelledError]).} =
   ## Seekable branch of `readBuffer`: drop any `readLine` read-ahead, read at the
   ## tracked `f.offset` through the `readSeekable` seam, then advance the offset.
   ## Split out so the raw `readBuffer` can `return` this future for seekable fds
   ## while keeping its non-seekable EAGAIN/`addReader2` machinery inline. The seam
   ## completes synchronously, so this never suspends or touches the dispatcher.
-  reconcile(f) # drop any readLine read-ahead so this read sees the logical pos
-  let n = await readSeekable(f, buf, size, f.offset, "read")
-  f.offset.inc(n)
-  return n
+  ##
+  ## Single-in-flight guard: a standalone read (`alreadyGuarded = false`) takes
+  ## and releases the `offset` slot itself; a multi-chunk caller holds it once
+  ## around its whole loop and passes true (see `withOffsetGuard`).
+  withOffsetGuard(f, alreadyGuarded):
+    reconcile(f) # drop any readLine read-ahead so this read sees the logical pos
+    let n = await readSeekable(f, buf, size, f.offset, "read")
+    f.offset.inc(n)
+    return n
 
 proc writeBufferSeekable(
     f: AsyncFile, buf: pointer, size: int
@@ -33,23 +38,27 @@ proc writeBufferSeekable(
   ## `writeBuffer` can `return` this future for seekable fds while keeping its
   ## non-seekable EAGAIN/`addWriter2` machinery inline. The seam completes
   ## synchronously, so this never suspends or touches the dispatcher.
-  reconcile(f) # drop any readLine read-ahead so this write sees the logical pos
-  var written = 0
-  while written < size:
-    let p = cast[pointer](cast[uint](buf) + uint(written))
-    let res = await writeSeekable(f, p, size - written, f.offset, "write")
-    written.inc(res)
-    f.offset.inc(res)
-
-proc readBuffer*(
-    f: AsyncFile, buf: pointer, size: int
-): Future[int] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
-  ## Reads up to `size` bytes into `buf`. Returns the number of bytes read; 0
-  ## means end of file. The caller owns `buf` and must keep it alive until the
-  ## returned future completes.
   ##
-  ## This is the low-level path and bypasses the `readLine` pushback buffer, so
-  ## do not interleave `readBuffer` with `readLine` on the same file.
+  ## Takes the single-in-flight `offset` slot once, held across the whole
+  ## partial-write loop, so a concurrent implicit-offset op is rejected with
+  ## `AsyncFileBusyError` (see `withOffsetGuard`).
+  withOffsetGuard(f):
+    reconcile(f) # drop any readLine read-ahead so this write sees the logical pos
+    var written = 0
+    while written < size:
+      let p = cast[pointer](cast[uint](buf) + uint(written))
+      let res = await writeSeekable(f, p, size - written, f.offset, "write")
+      written.inc(res)
+      f.offset.inc(res)
+
+proc readBufferImpl(
+    f: AsyncFile, buf: pointer, size: int, alreadyGuarded: bool
+): Future[int] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
+  ## Shared body of `readBuffer` (see it for the public contract). `alreadyGuarded`
+  ## is true when a multi-chunk caller (`readAll`/`readExactly` via `readInto`)
+  ## already holds the single-in-flight `offset` slot for the whole logical read,
+  ## so the seekable leaf must not re-take it; a standalone read passes false and
+  ## the leaf takes the slot for its one chunk.
   let uerr = usabilityError(f)
 
   # Fast path: a usable, non-empty seekable read needs none of the raw-future
@@ -62,7 +71,7 @@ proc readBuffer*(
     # Regular files / block devices: read at the tracked offset through the
     # seekable seam. Never returns EAGAIN, so it completes synchronously without
     # touching the dispatcher or the kernel file position.
-    return readBufferSeekable(f, buf, size)
+    return readBufferSeekable(f, buf, size, alreadyGuarded)
 
   let retFuture = newFuture[int]("chronos_file.readBuffer")
   if not uerr.isNil:
@@ -136,6 +145,22 @@ proc readBuffer*(
       retFuture.cancelCallback = cancel
   return retFuture
 
+proc readBuffer*(
+    f: AsyncFile, buf: pointer, size: int
+): Future[int] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
+  ## Reads up to `size` bytes into `buf`. Returns the number of bytes read; 0
+  ## means end of file. The caller owns `buf` and must keep it alive until the
+  ## returned future completes.
+  ##
+  ## This is the low-level path and bypasses the `readLine` pushback buffer, so
+  ## do not interleave `readBuffer` with `readLine` on the same file.
+  ##
+  ## **Concurrency (seekable files):** an implicit-offset op — at most one of the
+  ## family may be in flight; a second raises `AsyncFileBusyError` (see it for the
+  ## contract). Use `readBufferAt`/`readAt` for concurrent I/O. A zero-size call
+  ## is a no-op, neither taking the slot nor rejected by it.
+  return readBufferImpl(f, buf, size, alreadyGuarded = false)
+
 proc writeBuffer*(
     f: AsyncFile, buf: pointer, size: int
 ): Future[void] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
@@ -145,6 +170,11 @@ proc writeBuffer*(
   ## Not atomic on non-seekable fds (pipe/FIFO/tty): if the write suspends on a
   ## full buffer and is then cancelled or fails, the bytes already accepted by
   ## the kernel stay written and `f.offset` reflects that partial progress.
+  ##
+  ## **Concurrency (seekable files):** an implicit-offset op sharing the single
+  ## slot; a concurrent one raises `AsyncFileBusyError` (see it). Use
+  ## `writeBufferAt`/`writeAt` for concurrent positioned writes. A zero-size call
+  ## is a no-op, neither taking the slot nor rejected by it.
   let uerr = usabilityError(f)
 
   # Fast path (see readBuffer): a usable, non-empty seekable write delegates
@@ -232,7 +262,7 @@ proc writeBuffer*(
   return retFuture
 
 proc readInto(
-    f: AsyncFile, dst: pointer, size: int
+    f: AsyncFile, dst: pointer, size: int, alreadyGuarded: bool
 ): Future[int] {.async: (raises: [AsyncFileError, CancelledError]).} =
   ## Reads up to `size` bytes into `dst`, serving any `readLine` pushback
   ## first (unlike the low-level `readBuffer`, which bypasses it). Returns the
@@ -243,11 +273,16 @@ proc readInto(
   ## Never suspends while holding deliverable bytes: once pushback supplied
   ## something, the descriptor is tried at most once without blocking and
   ## EAGAIN/EOF yields a short read.
+  ##
+  ## `alreadyGuarded` is forwarded to the seekable read leaf; it is mandatory (no
+  ## default) so a caller can never silently drop it. Multi-chunk callers pass
+  ## true (they hold the slot for the whole loop); single-shot callers pass false.
+  ## Inert on the non-seekable and pushback paths (the guard is a no-op there).
   if size <= 0:
     return 0
 
   if f.pushback.len == 0:
-    return await readBuffer(f, dst, size)
+    return await readBufferImpl(f, dst, size, alreadyGuarded)
 
   # Pushback only ever exists on a non-seekable fd (bare CR in readLine), so
   # the sequential-read top-up below is the right path. Serve it in one batch
@@ -295,13 +330,17 @@ proc read*(
   ## Note: this allocates a `size`-byte buffer up front and shrinks it to the
   ## bytes actually read, so passing a very large `size` reserves that much even
   ## when far fewer bytes arrive.
+  ##
+  ## **Concurrency (seekable files):** an implicit-offset op sharing the single
+  ## slot; a concurrent one raises `AsyncFileBusyError` (see it). Use `readAt` for
+  ## concurrency.
   checkOpen(f)
 
   if size <= 0:
     return newSeq[byte](0)
 
   var buffer = newSeq[byte](size)
-  let n = await readInto(f, addr buffer[0], size)
+  let n = await readInto(f, addr buffer[0], size, alreadyGuarded = false)
   buffer.setLen(n)
   return buffer
 
@@ -319,7 +358,7 @@ proc readString*(
     return ""
 
   var buffer = newString(size)
-  let n = await readInto(f, addr buffer[0], size)
+  let n = await readInto(f, addr buffer[0], size, alreadyGuarded = false)
   buffer.setLen(n)
   return buffer
 
@@ -332,15 +371,18 @@ proc readAll*(
   ## result grows geometrically via `add`.
   checkOpen(f) # readInto (unlike read) does not guard the handle itself
 
-  const chunkSize = 64 * 1024
-  var data: seq[byte] = @[]
-  var chunk = newSeq[byte](chunkSize)
-  while true:
-    let n = await readInto(f, addr chunk[0], chunkSize)
-    if n == 0:
-      break
-    data.add(chunk.toOpenArray(0, n - 1))
-  return data
+  # Hold the offset slot for the whole multi-chunk read so the logical op is
+  # atomic; each chunk passes `alreadyGuarded = true` so it does not re-take it.
+  withOffsetGuard(f):
+    const chunkSize = 64 * 1024
+    var data: seq[byte] = @[]
+    var chunk = newSeq[byte](chunkSize)
+    while true:
+      let n = await readInto(f, addr chunk[0], chunkSize, alreadyGuarded = true)
+      if n == 0:
+        break
+      data.add(chunk.toOpenArray(0, n - 1))
+    return data
 
 proc readAllString*(
     f: AsyncFile
@@ -351,17 +393,19 @@ proc readAllString*(
   ## chunk buffer and pushback handling as `readAll`.
   checkOpen(f) # readInto (unlike read) does not guard the handle itself
 
-  const chunkSize = 64 * 1024
-  var data = ""
-  var chunk = newSeq[byte](chunkSize)
-  while true:
-    let n = await readInto(f, addr chunk[0], chunkSize)
-    if n == 0:
-      break
-    let oldLen = data.len
-    data.setLen(oldLen + n)
-    copyMem(addr data[oldLen], addr chunk[0], n)
-  return data
+  # Hold the single-in-flight offset slot across the whole read (see `readAll`).
+  withOffsetGuard(f):
+    const chunkSize = 64 * 1024
+    var data = ""
+    var chunk = newSeq[byte](chunkSize)
+    while true:
+      let n = await readInto(f, addr chunk[0], chunkSize, alreadyGuarded = true)
+      if n == 0:
+        break
+      let oldLen = data.len
+      data.setLen(oldLen + n)
+      copyMem(addr data[oldLen], addr chunk[0], n)
+    return data
 
 proc readExactly*(
     f: AsyncFile, size: int
@@ -387,16 +431,19 @@ proc readExactly*(
 
   if size <= 0:
     return newSeq[byte](0)
-  var data = newSeq[byte](size)
-  var have = 0
-  while have < size:
-    let n = await readInto(f, addr data[have], size - have)
-    if n == 0:
-      raise newAsyncFileIncompleteError(
-        "end of file after " & $have & " of " & $size & " bytes"
-      )
-    have.inc(n)
-  return data
+
+  # Hold the single-in-flight offset slot across the whole read (see `readAll`).
+  withOffsetGuard(f):
+    var data = newSeq[byte](size)
+    var have = 0
+    while have < size:
+      let n = await readInto(f, addr data[have], size - have, alreadyGuarded = true)
+      if n == 0:
+        raise newAsyncFileIncompleteError(
+          "end of file after " & $have & " of " & $size & " bytes"
+        )
+      have.inc(n)
+    return data
 
 proc readExactlyString*(
     f: AsyncFile, size: int
@@ -410,16 +457,19 @@ proc readExactlyString*(
 
   if size <= 0:
     return ""
-  var data = newString(size)
-  var have = 0
-  while have < size:
-    let n = await readInto(f, addr data[have], size - have)
-    if n == 0:
-      raise newAsyncFileIncompleteError(
-        "end of file after " & $have & " of " & $size & " bytes"
-      )
-    have.inc(n)
-  return data
+
+  # Hold the single-in-flight offset slot across the whole read (see `readAll`).
+  withOffsetGuard(f):
+    var data = newString(size)
+    var have = 0
+    while have < size:
+      let n = await readInto(f, addr data[have], size - have, alreadyGuarded = true)
+      if n == 0:
+        raise newAsyncFileIncompleteError(
+          "end of file after " & $have & " of " & $size & " bytes"
+        )
+      have.inc(n)
+    return data
 
 proc tryReadByte(f: AsyncFile): tuple[got: bool, b: byte] {.raises: [AsyncFileError].} =
   ## Non-blocking single-byte read used only for `readLine`'s CR/LF
@@ -485,7 +535,9 @@ proc readLine*(
   ##
   ## Seekable files (regular files / block devices) read into a persistent
   ## read-ahead buffer (`rbuf`); bytes past the terminator stay buffered for the
-  ## next call, so each byte is pread exactly once. Any later offset-based op
+  ## next call, so each byte is pread exactly once. As an implicit-offset op it
+  ## shares the single in-flight slot with `read`/`write` (a concurrent one
+  ## raises `AsyncFileBusyError`). Any later offset-based op
   ## (`read`/`write`/`writeAt`/`setFileSize`) reconciles by dropping the
   ## read-ahead and rewinding the offset, so positions stay consistent. Non-
   ## seekable fds (pipe/FIFO/tty) still read one byte at a time, leaving bytes
@@ -562,46 +614,50 @@ proc readLine*(
   # pread exactly once (no re-reading the tail). `refillReadBuf` is only called
   # once the buffer is exhausted, so it never drops unconsumed bytes.
   const chunkSize = 4096
-  var any = false
-  while true:
-    if f.rpos >= f.rbuf.len:
-      if not await refillReadBuf(f, chunkSize):
-        break # EOF: return whatever `line` accumulated
-    let ch = char(f.rbuf[f.rpos])
-    inc f.rpos
-    any = true
-    if ch == '\L':
-      return Opt.some(line)
-    elif ch == '\c':
-      # Need the byte after CR to tell CRLF from a bare CR; refill if the CR
-      # was the last buffered byte (it is already consumed, so this is safe).
+  # Hold the offset slot for the whole line (readLine is a multi-refill op): each
+  # refill passes `alreadyGuarded = true` so the slot stays held with no gap
+  # between refills. `withOffsetGuard` releases it on every exit.
+  withOffsetGuard(f):
+    var any = false
+    while true:
       if f.rpos >= f.rbuf.len:
-        try:
-          discard await refillReadBuf(f, chunkSize)
-        except AsyncFileError:
-          # The peek's pread failed with a real I/O error (not EOF). The line is
-          # already complete — the CR terminated it — so do not lose it to the
-          # exception. Return it now; the error resurfaces on the next call,
-          # which re-attempts the refill from the post-CR position (refill left
-          # rbuf empty and the offset unchanged, so no byte is skipped or
-          # re-read). Mirrors the bare-CR-at-EOF case: an un-peekable next byte
-          # still leaves a complete line.
-          return Opt.some(line)
-      if f.rpos < f.rbuf.len and char(f.rbuf[f.rpos]) == '\L':
-        inc f.rpos # CRLF: consume the LF
-      # else bare CR (or EOF): leave the peeked byte unconsumed for next call.
+        if not await refillReadBuf(f, chunkSize, alreadyGuarded = true):
+          break # EOF: return whatever `line` accumulated
+      let ch = char(f.rbuf[f.rpos])
+      inc f.rpos
+      any = true
+      if ch == '\L':
+        return Opt.some(line)
+      elif ch == '\c':
+        # Need the byte after CR to tell CRLF from a bare CR; refill if the CR
+        # was the last buffered byte (it is already consumed, so this is safe).
+        if f.rpos >= f.rbuf.len:
+          try:
+            discard await refillReadBuf(f, chunkSize, alreadyGuarded = true)
+          except AsyncFileError:
+            # The peek's pread failed with a real I/O error (not EOF). The line
+            # is already complete — the CR terminated it — so do not lose it to
+            # the exception. Return it now; the error resurfaces on the next
+            # call, which re-attempts the refill from the post-CR position
+            # (refill left rbuf empty and the offset unchanged, so no byte is
+            # skipped or re-read). Mirrors the bare-CR-at-EOF case: an
+            # un-peekable next byte still leaves a complete line.
+            return Opt.some(line)
+        if f.rpos < f.rbuf.len and char(f.rbuf[f.rpos]) == '\L':
+          inc f.rpos # CRLF: consume the LF
+        # else bare CR (or EOF): leave the peeked byte unconsumed for next call.
+        return Opt.some(line)
+      else:
+        if limit > 0 and line.len >= limit:
+          # Leave the over-limit byte unconsumed in the read-ahead, so the
+          # position stays at the limit boundary.
+          dec f.rpos
+          raise newAsyncFileLimitError("line exceeds limit of " & $limit & " bytes")
+        line.add(ch)
+    if any:
       return Opt.some(line)
     else:
-      if limit > 0 and line.len >= limit:
-        # Leave the over-limit byte unconsumed in the read-ahead, so the
-        # position stays at the limit boundary.
-        dec f.rpos
-        raise newAsyncFileLimitError("line exceeds limit of " & $limit & " bytes")
-      line.add(ch)
-  if any:
-    return Opt.some(line)
-  else:
-    return Opt.none(string)
+      return Opt.none(string)
 
 template lines*(f: AsyncFile, lineVar: untyped, body: untyped) =
   ## Runs `body` once per remaining line of `f`, binding each line (without its
@@ -629,6 +685,10 @@ proc write*(
   ## async environment, so no extra copy is needed. Not atomic on non-seekable
   ## fds (see `writeBuffer`): a cancelled or failed write may leave part of
   ## `data` already written.
+  ##
+  ## **Concurrency (seekable files):** an implicit-offset op sharing the single
+  ## in-flight slot with `read`/`readLine`; a concurrent one raises
+  ## `AsyncFileBusyError`. Use `writeAt` for concurrent positioned writes.
   checkOpen(f)
   if data.len == 0:
     return
@@ -693,6 +753,12 @@ proc writeBufferAt*(
   ## Argument order: `offset` comes first, consistent with the high-level
   ## `writeAt(f, offset, data)` (this is *not* the `pwrite(fd, buf, size,
   ## offset)` C order — `offset` leads in every `*At` proc).
+  ##
+  ## **Concurrency (seekable files):** unlike the positioned *read* family
+  ## (offset-independent, never rejected), a positioned write must drop the
+  ## `readLine` read-ahead (touching `offset`), so it raises `AsyncFileBusyError`
+  ## while a seekable implicit-offset op is in flight. Otherwise it never blocks
+  ## concurrent positioned reads.
   let uerr = usabilityError(f)
   if not uerr.isNil:
     raise uerr
@@ -707,8 +773,12 @@ proc writeBufferAt*(
   if f.appendMode:
     raise newAsyncFileError("positioned write is not allowed in append mode (fmAppend)")
 
-  # A positioned write may overwrite bytes held in readLine's read-ahead; drop
-  # it so a later implicit read does not serve stale (pre-write) bytes.
+  # A positioned write may overwrite bytes in readLine's read-ahead; drop it so a
+  # later implicit read does not serve stale bytes. That touches `offset`, so it
+  # is turned away while an implicit-offset op holds the slot (else the reconcile
+  # would corrupt that op once the seam yields). The writes below use only the
+  # explicit `offset`, so no slot is held across the await.
+  checkOffsetIdle(f)
   reconcile(f)
   # Write the whole buffer through the seam one chunk at a time (handling partial
   # writes), advancing the explicit offset only — `f.offset` is never touched.

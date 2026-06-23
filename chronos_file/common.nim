@@ -32,6 +32,16 @@ type
       ## EAGAIN path). Tracked so `close` can fail it instead of leaking it.
     writeFut*: Future[void]
       ## In-flight `writeBuffer` future while it waits on `addWriter2`.
+    seekOpInFlight*: bool
+      ## Single in-flight slot for the *seekable* implicit-offset family
+      ## (`read`/`write`/`readLine` and compound forms, which share `offset`):
+      ## while held, a second such op raises `AsyncFileBusyError`. Held across one
+      ## whole logical op (every chunk of a multi-chunk read), so it is atomic.
+      ## Positioned reads (`readAt`/`readBufferAt`) ignore it; positioned writes
+      ## and positioning ops are turned away via `checkOffsetIdle`. No-op for
+      ## non-seekable fds (they use `readFut`/`writeFut`). Set and cleared within
+      ## one synchronous run today; load-bearing once the seam suspends (io_uring).
+      ## See `acquireOffsetGuard`.
     appendMode*: bool
       ## True when opened with `fmAppend`. Append-mode writes use a sequential
       ## `write` (the kernel appends atomically) instead of `pwrite` at
@@ -82,10 +92,20 @@ type
     code*: OSErrorCode
 
   AsyncFileBusyError* = object of AsyncFileError
-    ## Raised when a second read/write is issued on a non-seekable fd
-    ## (pipe/FIFO/tty) while one is already in flight. Only one read and one
-    ## write may wait on the descriptor at a time. Subtype of `AsyncFileError`,
-    ## so `except AsyncFileError` still catches it.
+    ## Raised when a second concurrent op collides with one in flight on the same
+    ## handle:
+    ## - **Non-seekable fd** (pipe/FIFO/tty): a second `read` (or `write`) while
+    ##   one waits on the descriptor. Read and write are tracked separately, so
+    ##   one of each may be in flight at once.
+    ## - **Seekable file** (regular file / block device): a second implicit-offset
+    ##   op (`read`/`write`/`readLine` and compound forms) while one is in flight;
+    ##   they share a single slot because they all mutate `offset`. For concurrent
+    ##   reads use `readAt`/`readBufferAt` (offset-independent, never rejected).
+    ##   Positioned writes (`writeAt`/`writeBufferAt`) and positioning ops
+    ##   (`setFilePos`/`setFileSize`) also raise this while a slot is held, since
+    ##   they must drop the read-ahead (touching `offset`).
+    ##
+    ## Subtype of `AsyncFileError`, so `except AsyncFileError` still catches it.
 
   AsyncFileIncompleteError* = object of AsyncFileError
     ## Raised by `readExactly` when end of file is reached before the requested

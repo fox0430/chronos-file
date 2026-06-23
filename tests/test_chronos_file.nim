@@ -12,4 +12,4 @@
 
 import
   test_posix_handle, test_posix_io, test_posix_flush_close, test_common,
-  test_flush_backstop
+  test_flush_backstop, test_seekable_concurrency

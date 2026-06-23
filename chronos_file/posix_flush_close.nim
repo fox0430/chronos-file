@@ -243,6 +243,12 @@ proc closeImpl(f: AsyncFile) {.raises: [AsyncFileError].} =
   ## futures, unregisters non-seekable fds and closes the descriptor. Carries
   ## no `closing` guard, so `closeWait` can call it while `f.closing` is set
   ## (the public `close` adds that guard).
+  ##
+  ## Only the non-seekable EAGAIN futures (`readFut`/`writeFut`) are drained here.
+  ## A seekable op completes synchronously today, so `seekOpInFlight` is never set
+  ## at close and there is nothing seekable to drain. Once the seam suspends
+  ## (io_uring) a suspended seekable op will need a cancellable future tracked and
+  ## drained here — see `IO_URING_TODO.md` (A4/B4).
   if not f.opened or f.closed:
     return
 
