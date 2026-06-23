@@ -149,8 +149,17 @@ proc readBuffer*(
     f: AsyncFile, buf: pointer, size: int
 ): Future[int] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
   ## Reads up to `size` bytes into `buf`. Returns the number of bytes read; 0
-  ## means end of file. The caller owns `buf` and must keep it alive until the
-  ## returned future completes.
+  ## means end of file.
+  ##
+  ## **Buffer ownership / cancellation:** the caller owns `buf` and must keep it
+  ## valid until the returned future *settles* — not merely until it completes.
+  ## Cancellation drains the in-flight read before the future resolves, so cancel
+  ## with `cancelAndWait` and do not release `buf` until that returns. (On the
+  ## synchronous backend a seekable read completes without suspending, so there is
+  ## no cancellation point; stating the rule now keeps the contract stable once the
+  ## io_uring backend can leave a read in flight across a cancel.) For a buffer the
+  ## library owns and manages — fully cancel-safe, with no caller-side lifetime
+  ## rule — use the high-level `read`/`readAt` instead.
   ##
   ## This is the low-level path and bypasses the `readLine` pushback buffer, so
   ## do not interleave `readBuffer` with `readLine` on the same file.
@@ -164,8 +173,17 @@ proc readBuffer*(
 proc writeBuffer*(
     f: AsyncFile, buf: pointer, size: int
 ): Future[void] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
-  ## Writes exactly `size` bytes from `buf`. Handles partial writes. The caller
-  ## owns `buf` and must keep it alive until the returned future completes.
+  ## Writes exactly `size` bytes from `buf`. Handles partial writes.
+  ##
+  ## **Buffer ownership / cancellation:** the caller owns `buf` and must keep it
+  ## valid until the returned future *settles* — not merely until it completes.
+  ## Cancellation drains the in-flight write before the future resolves, so cancel
+  ## with `cancelAndWait` and do not release `buf` until that returns. (On the
+  ## synchronous backend a seekable write completes without suspending, so there is
+  ## no cancellation point; stating the rule now keeps the contract stable once the
+  ## io_uring backend can leave a write in flight across a cancel.) For a buffer the
+  ## library owns and manages — fully cancel-safe, with no caller-side lifetime
+  ## rule — use the high-level `write`/`writeAt` instead.
   ##
   ## Not atomic on non-seekable fds (pipe/FIFO/tty): if the write suspends on a
   ## full buffer and is then cancelled or fails, the bytes already accepted by
@@ -710,6 +728,12 @@ proc readBufferAt*(
   ## using or modifying the file position. Seekable files only (pipes/FIFOs fail
   ## with ESPIPE).
   ##
+  ## **Buffer ownership / cancellation:** the caller owns `buf` and must keep it
+  ## valid until the returned future *settles* (see `readBuffer` for the full
+  ## contract): cancellation drains the in-flight read before the future resolves,
+  ## so cancel with `cancelAndWait` and do not release `buf` until that returns.
+  ## For a library-owned buffer use the high-level `readAt` instead.
+  ##
   ## Argument order: `offset` comes first, consistent with the high-level
   ## `readAt(f, offset, size)` (this is *not* the `pread(fd, buf, size, offset)`
   ## C order — `offset` leads in every `*At` proc).
@@ -749,6 +773,12 @@ proc writeBufferAt*(
   ## `O_APPEND` and appends instead, which would silently violate the
   ## positioned-write contract (and allowing it only on POSIX-conforming
   ## platforms would make behavior platform-dependent).
+  ##
+  ## **Buffer ownership / cancellation:** the caller owns `buf` and must keep it
+  ## valid until the returned future *settles* (see `writeBuffer` for the full
+  ## contract): cancellation drains the in-flight write before the future resolves,
+  ## so cancel with `cancelAndWait` and do not release `buf` until that returns.
+  ## For a library-owned buffer use the high-level `writeAt` instead.
   ##
   ## Argument order: `offset` comes first, consistent with the high-level
   ## `writeAt(f, offset, data)` (this is *not* the `pwrite(fd, buf, size,
