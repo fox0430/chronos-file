@@ -1,3 +1,9 @@
 nimcache/
 nimblecache/
 htmldocs/
+
+chronos_file/*
+!chronos_file/*.*
+
+tests/*
+!tests/*.*
