@@ -172,19 +172,33 @@ proc refillReadBuf*(
   ## line and calls this with `alreadyGuarded = true`, so a concurrent op is
   ## rejected for the entire op (not just per refill — a per-refill guard would
   ## leave a gap once the seam suspends). Standalone (false) it takes the slot.
+  ##
+  ## Cancellation / error safety: the buffer grows to `chunkSize` before the seam
+  ## read (the sole suspension point). If that read aborts before committing — an
+  ## I/O error or a cancellation (reachable once io_uring can leave a read in
+  ## flight; the seam completes inline today) — the `finally` drops the grown,
+  ## zero-filled buffer back to empty with `f.offset` untouched. Since refill is
+  ## only entered with the previous buffer consumed, that restores the exact
+  ## pre-refill position (`getFilePos == offset - pushback`): no phantom zeros, no
+  ## drift, and the next readLine re-reads the same chunk.
   withOffsetGuard(f, alreadyGuarded):
+    # Precondition the rollback depends on: refill is entered with the previous
+    # buffer fully consumed (`rpos == rbuf.len`) and `f.offset` not yet advanced
+    # for this refill. That is what makes "leave `f.offset` untouched" restore the
+    # exact pre-refill position. A future caller that enters with unconsumed bytes
+    # or a half-advanced offset would drift silently — pin the invariant here.
+    assert f.rpos == f.rbuf.len
     f.rbuf.setLen(chunkSize)
 
-    let n =
-      try:
-        await readSeekable(f, addr f.rbuf[0], chunkSize, f.offset, "readLine")
-      except AsyncFileError as e:
-        # Drop the grown (zero-filled) buffer: leaving rbuf.len > rpos would
-        # make readLine serve phantom zeros and getFilePos/reconcile drift.
-        # An empty buffer preserves the logical position.
+    var n = 0
+    var committed = false
+    try:
+      n = await readSeekable(f, addr f.rbuf[0], chunkSize, f.offset, "readLine")
+      committed = true
+    finally:
+      if not committed:
         f.rbuf.setLen(0)
         f.rpos = 0
-        raise e
 
     f.offset.inc(n)
     f.rbuf.setLen(n)

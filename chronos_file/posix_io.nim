@@ -574,14 +574,19 @@ proc readLine*(
   ## e.g. the writer sent `\c\L` together) CRLF is still recognised as one
   ## terminator.
   ##
-  ## If a mid-line read fails (or, on a non-seekable fd, is cancelled), the
-  ## partial line accumulated so far is lost with the exception and the file
-  ## position remains where reading stopped — i.e. in the middle of the line,
-  ## not at its start. The handle itself stays consistent and usable. An
-  ## *already complete* line is never lost this way: once its terminator has
-  ## been read, a failure of the post-CR peek (the read-ahead refill needed only
-  ## to tell CRLF from a bare CR) still returns the line, deferring the error to
-  ## the next call.
+  ## If a mid-line read fails — or is cancelled — the partial line so far is lost
+  ## with the exception and the position stays where reading stopped (mid-line, not
+  ## at its start); the handle stays consistent and usable. On a seekable file the
+  ## refill is the sole suspension point and rolls its state back on a failed or
+  ## cancelled refill (see `refillReadBuf`); it completes synchronously today, so a
+  ## cancellation point appears only once the io_uring backend can leave a refill
+  ## in flight.
+  ##
+  ## An *already complete* line is never lost to a post-CR peek *error*: once the
+  ## terminator is read, an I/O failure of the peek (the refill needed only to tell
+  ## CRLF from a bare CR) still returns the line, deferring the error to the next
+  ## call. A *cancellation* of that peek instead propagates as `CancelledError`,
+  ## discarding the line like any mid-op cancel, with the position left after the CR.
   checkOpen(f)
 
   var line = ""

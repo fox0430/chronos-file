@@ -305,14 +305,16 @@ suite "chronos_file: posix_io (read/write surface)":
     # readLine pushback. The post-CR peek then hits a broken fd (EBADF). The
     # completed line must be returned, and the error must resurface on the next
     # readLine.
-    var f = AsyncFile(
-      fd: AsyncFD(cint(-1)),
-      offset: 0,
-      seekable: false,
-      opened: true,
-      pushback: @[byte '\r'],
-    )
-    try:
+    withFakeFile(
+      f,
+      AsyncFile(
+        fd: AsyncFD(cint(-1)),
+        offset: 0,
+        seekable: false,
+        opened: true,
+        pushback: @[byte '\r'],
+      ),
+    ):
       check (await f.readLine()) == Opt.some("")
       var failed = false
       try:
@@ -320,12 +322,6 @@ suite "chronos_file: posix_io (read/write surface)":
       except AsyncFileOsError:
         failed = true
       check failed
-    finally:
-      # Always clear `opened` before the handle is destroyed: were a regression
-      # to make the first readLine raise instead, an unwinding destructor would
-      # unregister2/closeFd the invalid fd (and unregistering an fd that was
-      # never registered aborts in the dispatcher), masking the test failure.
-      f.opened = false
 
   asyncTest "readLine returns a completed bare-CR line when the seekable peek pread fails":
     # Construct a seekable handle with a full chunk whose last byte is a CR.
@@ -333,15 +329,17 @@ suite "chronos_file: posix_io (read/write surface)":
     # from a bare CR) fails with EBADF. The completed line must still be
     # returned, and the error must resurface on the next call.
     let body = "a".repeat(4095)
-    var f = AsyncFile(
-      fd: AsyncFD(cint(-1)),
-      offset: 4096,
-      seekable: true,
-      opened: true,
-      rbuf: (body & "\r").toBytes,
-      rpos: 0,
-    )
-    try:
+    withFakeFile(
+      f,
+      AsyncFile(
+        fd: AsyncFD(cint(-1)),
+        offset: 4096,
+        seekable: true,
+        opened: true,
+        rbuf: (body & "\r").toBytes,
+        rpos: 0,
+      ),
+    ):
       check (await f.readLine()) == Opt.some(body)
       var failed = false
       try:
@@ -349,12 +347,72 @@ suite "chronos_file: posix_io (read/write surface)":
       except AsyncFileOsError:
         failed = true
       check failed
-    finally:
-      # Always clear `opened` before the handle is destroyed (see the
-      # non-seekable peek-failure test): a regression that raised on the first
-      # readLine would otherwise let the destructor closeFd the invalid fd while
-      # unwinding, masking the failure.
-      f.opened = false
+
+  asyncTest "seekable readLine completes synchronously (no cancellation point today)":
+    # White-box (mirrors test_buffer_ownership.nim / A4): the refill's `pread`
+    # completes inline today, so a seekable readLine never suspends — its future is
+    # already finished before it is awaited, leaving no point at which a cancel
+    # could tear a refill. `refillReadBuf`'s cancel rollback is thus unreachable
+    # until the io_uring seam can leave a refill in flight; this check flips then.
+    let path = tempPath(".txt")
+    let f = openAsync(path, fmReadWrite)
+    # A first line longer than one 4096-byte chunk forces a multi-refill read;
+    # all of it stays synchronous, so the future is still finished on return.
+    let first = "a".repeat(5000)
+    await f.write(first & "\n" & "second\n")
+    f.setFilePos(0)
+
+    block:
+      let fut = f.readLine()
+      check fut.finished() # consumed across refills without ever suspending
+      check (await fut) == Opt.some(first)
+    block:
+      let fut = f.readLine()
+      check fut.finished()
+      check (await fut) == Opt.some("second")
+
+    f.close()
+    removeFile(path)
+
+  asyncTest "a failed mid-line refill rolls back to the pre-refill position":
+    # White-box: a buffered chunk holds a partial line with no terminator, so
+    # readLine consumes it all and must refill; the invalid fd makes that refill
+    # fail with EBADF. The partial line is lost, but `refillReadBuf`'s rollback
+    # drops the grown buffer and leaves `f.offset` untouched, so getFilePos still
+    # reports where reading stopped.
+    #
+    # Scope: this drives the *error* arm of the rollback only, so it also passes
+    # against the pre-commit `except AsyncFileError` code — it is a regression
+    # guard for the position invariant, not proof that the try/finally rewrite
+    # changed behavior. The genuinely new arm (rollback on *cancellation*) cannot
+    # be exercised today: the seam completes inline (see the synchronous-completion
+    # test above), so there is no suspension point at which to cancel a refill.
+    # Error and cancel share the one `finally`, so pinning the invariant here is
+    # the closest the cancel arm can be covered until the io_uring seam suspends.
+    let body = "a".repeat(4096) # a full chunk, no terminator
+    withFakeFile(
+      f,
+      AsyncFile(
+        fd: AsyncFD(cint(-1)),
+        offset: 4096, # end of the buffered chunk
+        seekable: true,
+        opened: true,
+        rbuf: body.toBytes,
+        rpos: 0,
+      ),
+    ):
+      check f.getFilePos() == 0 # start of the buffered chunk
+      var failed = false
+      try:
+        discard await f.readLine()
+      except AsyncFileOsError:
+        failed = true
+      check failed
+      # Rollback: empty buffer, offset untouched -> position at where reading stopped.
+      check f.rbuf.len == 0
+      check f.rpos == 0
+      check f.getFilePos() == 4096
+      check not f.seekOpInFlight # the offset slot was released on the way out
 
   asyncTest "readAt / writeAt do not disturb the file position":
     let path = tempPath(".bin")
