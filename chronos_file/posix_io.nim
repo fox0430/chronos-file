@@ -16,8 +16,10 @@ proc readBufferSeekable(
   ## Seekable branch of `readBuffer`: drop any `readLine` read-ahead, read at the
   ## tracked `f.offset` through the `readSeekable` seam, then advance the offset.
   ## Split out so the raw `readBuffer` can `return` this future for seekable fds
-  ## while keeping its non-seekable EAGAIN/`addReader2` machinery inline. The seam
-  ## completes synchronously, so this never suspends or touches the dispatcher.
+  ## while keeping its non-seekable EAGAIN/`addReader2` machinery inline. On the
+  ## synchronous backend the seam completes inline, so this never suspends; under
+  ## the io_uring backend it suspends until the CQE and can be cancelled mid-read
+  ## (see `readSeekable`).
   ##
   ## Single-in-flight guard: a standalone read (`alreadyGuarded = false`) takes
   ## and releases the `offset` slot itself; a multi-chunk caller holds it once
@@ -33,11 +35,22 @@ proc writeBufferSeekable(
 ): Future[void] {.async: (raises: [AsyncFileError, CancelledError]).} =
   ## Seekable branch of `writeBuffer`: drop any `readLine` read-ahead, then write
   ## the whole buffer through the append-aware `writeSeekable` seam one chunk at a
-  ## time, advancing `f.offset` per successful chunk so a mid-write error leaves
-  ## it consistent with the bytes actually written. Split out so the raw
+  ## time, advancing `f.offset` per successful chunk. So a mid-write *error* leaves
+  ## `f.offset` consistent with the bytes actually written — the failing chunk wrote
+  ## nothing and every chunk folded into the offset completed. Split out so the raw
   ## `writeBuffer` can `return` this future for seekable fds while keeping its
-  ## non-seekable EAGAIN/`addWriter2` machinery inline. The seam completes
-  ## synchronously, so this never suspends or touches the dispatcher.
+  ## non-seekable EAGAIN/`addWriter2` machinery inline. On the synchronous backend
+  ## the seam completes inline, so this never suspends; under io_uring each chunk
+  ## suspends until the CQE and can be cancelled between chunks (see `writeSeekable`).
+  ##
+  ## A mid-write *cancellation* under io_uring is weaker, by design: drain-on-cancel
+  ## lets the cancel win (see `wireDrain`). If a chunk's write durably landed but its
+  ## CQE is reaped in the same tick the cancel arrives, the seam settles `Cancelled`
+  ## and discards the byte count, so the `await` raises before that chunk's
+  ## `f.offset.inc`. `f.offset` can thus lag the bytes on disk by up to one chunk —
+  ## after a cancelled seekable write the position is unreliable, so `setFilePos`
+  ## before resuming implicit-offset I/O or the next read/write may overwrite the
+  ## durably-written tail.
   ##
   ## Takes the single-in-flight `offset` slot once, held across the whole
   ## partial-write loop, so a concurrent implicit-offset op is rejected with
@@ -69,8 +82,10 @@ proc readBufferImpl(
   # and uses `retFuture`.
   if uerr.isNil and size > 0 and f.seekable:
     # Regular files / block devices: read at the tracked offset through the
-    # seekable seam. Never returns EAGAIN, so it completes synchronously without
-    # touching the dispatcher or the kernel file position.
+    # seekable seam, which never returns EAGAIN — so this path needs none of the
+    # raw-future EAGAIN/`addReader2` machinery below. The seam helper owns the
+    # backend (a synchronous `pread`, or an io_uring submission that suspends) and
+    # the offset bookkeeping; either way the kernel file position is untouched.
     return readBufferSeekable(f, buf, size, alreadyGuarded)
 
   let retFuture = newFuture[int]("chronos_file.readBuffer")
@@ -185,6 +200,14 @@ proc writeBuffer*(
   ## library owns and manages — fully cancel-safe, with no caller-side lifetime
   ## rule — use the high-level `write`/`writeAt` instead.
   ##
+  ## On a seekable fd, a cancel can also leave the *file position* behind the bytes
+  ## actually written: a chunk whose io_uring write completes in the same tick the
+  ## cancel lands is drained as `Cancelled` with its byte count discarded, so
+  ## `f.offset` may lag the durably-written tail by up to one chunk. Treat the
+  ## position as unreliable after a cancelled write — `setFilePos` before resuming
+  ## `read`/`write`, or they may overwrite those bytes. The positioned `*At` ops
+  ## ignore `f.offset` and are unaffected.
+  ##
   ## Not atomic on non-seekable fds (pipe/FIFO/tty): if the write suspends on a
   ## full buffer and is then cancelled or fails, the bytes already accepted by
   ## the kernel stay written and `f.offset` reflects that partial progress.
@@ -203,8 +226,9 @@ proc writeBuffer*(
     # seekable seam — pwrite normally, or a sequential write() in append mode so
     # the kernel picks the end of file (atomic append) on every platform (pwrite
     # would only append on Linux and would overwrite at a stale offset on
-    # POSIX-conforming platforms). Completes synchronously; the seam is
-    # append-aware and the helper advances `f.offset` per successful chunk.
+    # POSIX-conforming platforms). The seam is append-aware and the helper
+    # advances `f.offset` per successful chunk; the synchronous backend completes
+    # inline, while io_uring suspends per chunk (append always stays synchronous).
     return writeBufferSeekable(f, buf, size)
 
   let retFuture = newFuture[void]("chronos_file.writeBuffer")
@@ -442,9 +466,12 @@ proc readExactly*(
   ## cancel-safe), `readExactly` consumes bytes across several reads. On a
   ## non-seekable fd (pipe/FIFO/tty), cancelling after some bytes have already
   ## been read discards them — pipe bytes cannot be un-read, and any `readLine`
-  ## pushback consumed by an earlier iteration is not restored. Seekable files
-  ## are unaffected: every read completes synchronously, so `readExactly` never
-  ## suspends and there is no point at which it can be cancelled mid-way.
+  ## pushback consumed by an earlier iteration is not restored. On a seekable file
+  ## the same caveat applies only under the io_uring backend: each chunk suspends
+  ## until its CQE, so cancelling after some chunks have completed discards the
+  ## partial buffer while `f.offset` stays advanced past the bytes already read.
+  ## On the synchronous backend every chunk completes inline, so `readExactly`
+  ## never suspends and there is no point at which it can be cancelled mid-way.
   checkOpen(f)
 
   if size <= 0:
@@ -469,8 +496,9 @@ proc readExactlyString*(
   ## `readExactly` returning a `string` instead of `seq[byte]`. Reads exactly
   ## `size` bytes, raising `AsyncFileIncompleteError` if end of file is reached
   ## first; `size <= 0` returns `""`. Shares `readExactly`'s contract, including
-  ## its cancellation caveat on non-seekable fds (bytes consumed by earlier
-  ## iterations are discarded if cancelled mid-way).
+  ## its cancellation caveat (bytes consumed by earlier iterations are discarded if
+  ## cancelled mid-way — always on a non-seekable fd, and on a seekable fd under
+  ## the io_uring backend).
   checkOpen(f)
 
   if size <= 0:
@@ -578,9 +606,10 @@ proc readLine*(
   ## with the exception and the position stays where reading stopped (mid-line, not
   ## at its start); the handle stays consistent and usable. On a seekable file the
   ## refill is the sole suspension point and rolls its state back on a failed or
-  ## cancelled refill (see `refillReadBuf`); it completes synchronously today, so a
-  ## cancellation point appears only once the io_uring backend can leave a refill
-  ## in flight.
+  ## cancelled refill (see `refillReadBuf`). On the synchronous backend it completes
+  ## inline, so no such cancellation point exists; under the io_uring backend the
+  ## refill can be left in flight, so a cancel there discards the partial line just
+  ## as above.
   ##
   ## An *already complete* line is never lost to a post-CR peek *error*: once the
   ## terminator is read, an I/O failure of the peek (the refill needed only to tell
@@ -728,7 +757,7 @@ proc write*(
 
 proc readBufferAt*(
     f: AsyncFile, offset: int64, buf: pointer, size: int
-): Future[int] {.async: (raw: true, raises: [AsyncFileError]).} =
+): Future[int] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
   ## Reads up to `size` bytes into `buf` starting at absolute `offset`, without
   ## using or modifying the file position. Seekable files only (pipes/FIFOs fail
   ## with ESPIPE).
@@ -744,16 +773,18 @@ proc readBufferAt*(
   ## C order — `offset` leads in every `*At` proc).
   ##
   ## Because it never touches `f.offset`, it does not interfere with concurrent
-  ## implicit-offset I/O (`read`/`write`) on the same file. Note that on a
-  ## seekable fd every operation completes synchronously without yielding to the
-  ## dispatcher, so distinct operations never actually overlap mid-flight — the
-  ## real value here is offset-independence, not interleaving.
+  ## implicit-offset I/O (`read`/`write`). On the synchronous backend every seekable
+  ## op completes inline, so distinct ops never overlap mid-flight and the value here
+  ## is offset-independence, not interleaving; under io_uring positioned reads suspend,
+  ## so concurrent `*At` ops can genuinely be in flight together (each tracked for
+  ## `closeWait` to drain — see `seekFuts`).
   let uerr = usabilityError(f)
 
   # Fast path: a usable, non-empty positioned read is exactly the seam — a single
   # seekable read at an explicit offset — so return its future directly (it never
-  # touches `f.offset`). No `retFuture` is allocated on this hot path; only the
-  # error/empty cases below need one.
+  # touches `f.offset`). The seam (`readSeekable`) owns the negative-offset check now,
+  # uniformly across backends, so it is not screened here. No `retFuture` on this hot
+  # path; only the error/empty cases below need one.
   if uerr.isNil and size > 0:
     return readSeekable(f, buf, size, offset, "readAt")
 
@@ -765,7 +796,9 @@ proc readBufferAt*(
     # See readBuffer: never let a negative size reach the syscall.
     retFuture.fail(newAsyncFileError("negative read size: " & $size))
     return retFuture
-  # size == 0: a no-op positioned read.
+  # The only case left is size == 0 (a non-empty usable read took the fast path):
+  # a no-op positioned read touches nothing, so the offset is never used — a
+  # negative one stays a no-op too, matching writeBufferAt's zero-size path.
   retFuture.complete(0)
   return retFuture
 
@@ -803,7 +836,9 @@ proc writeBufferAt*(
   if size == 0:
     # A zero-byte positioned write touches nothing, so treat it as a no-op even
     # in append mode (consistent with the high-level writeAt, which returns
-    # early on empty data before this proc is reached).
+    # early on empty data before this proc is reached). A negative offset with
+    # size 0 stays a no-op too, since the offset is never used. A negative offset
+    # with size > 0 is rejected by the seam below (`writeSeekable`), not here.
     return
   if f.appendMode:
     raise newAsyncFileError("positioned write is not allowed in append mode (fmAppend)")
@@ -817,7 +852,13 @@ proc writeBufferAt*(
   reconcile(f)
   # Write the whole buffer through the seam one chunk at a time (handling partial
   # writes), advancing the explicit offset only — `f.offset` is never touched.
-  # Append mode was rejected above, so the seam takes its `pwrite` path here.
+  # Append mode was rejected above, so the seam takes its `pwrite` path here. The
+  # seam (`writeSeekable`) owns the negative-offset check: it rejects both the
+  # initial `offset` and a per-chunk `offset + written` that wrapped int64 to
+  # negative, uniformly across backends, so no offset guard is replicated here. (In
+  # a checked build the `offset + int64(written)` below would `OverflowDefect`
+  # before the seam sees the wrapped value; both need an ~8-EiB offset, unreachable
+  # on real files, so the seam's guard is what backstops the unchecked build.)
   var written = 0
   while written < size:
     let p = cast[pointer](cast[uint](buf) + uint(written))
