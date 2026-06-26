@@ -51,8 +51,8 @@ waitFor main()
 
 ## io_uring backend (opt-in)
 
-On Linux, regular-file I/O can be routed through [io_uring](https://github.com/fox0430/iori)
-instead of the blocking `pread`/`pwrite` path, so seekable reads/writes (and
+On Linux, regular-file I/O can be routed through **io_uring** instead of the blocking
+`pread`/`pwrite` path, so seekable reads/writes (and
 `flush`) become **truly asynchronous** and several can be in flight at once.
 Append-mode writes are the one exception (see below).
 
