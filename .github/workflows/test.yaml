@@ -96,5 +96,8 @@ jobs:
     - name: Install iori
       run: nimble install iori
 
+    - name: Run unit tests
+      run: nimble test -y
+
     - name: Run io_uring unit tests
       run: nimble testUring -y
