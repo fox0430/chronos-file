@@ -7,7 +7,7 @@ from std/os import FilePermission
 import pkg/chronos
 import pkg/chronos/[osutils, oserrno]
 
-import common, posix_backend
+import common, posix_backend, uring_io
 
 {.push raises: [].}
 
@@ -116,29 +116,135 @@ template withOffsetGuard*(f: AsyncFile, body: untyped) =
   ## See the three-argument overload for the acquire-before-try contract.
   withOffsetGuard(f, false, body)
 
+template seekableSeam(
+    f: AsyncFile,
+    buf: pointer,
+    size: int,
+    offset: int64,
+    context: string,
+    opName: string,
+    pinAppend: static bool,
+    ringEligible: untyped,
+    uringSeam: untyped,
+    syncBody: untyped,
+) =
+  ## Shared skeleton of the two seekable seams, spliced in as each proc's *whole*
+  ## body so its `return`s leave the seam — nothing may follow a `seekableSeam(...)`
+  ## call (it would be unreachable, and Nim does not warn). Steps: reject a negative
+  ## offset; under the io_uring backend dispatch a usable, ring-eligible op through
+  ## `uringSeam` (with the per-chunk close-drain guard, registered for the drain);
+  ## otherwise complete inline from `syncBody`. `readSeekable`/`writeSeekable` differ
+  ## only in `ringEligible` (read serves append files, write excludes them — io_uring
+  ## has no write-at-end mode), `uringSeam`, `pinAppend` (write pins the append
+  ## carve-out, read does not), `opName`, and `syncBody`. The future id is derived
+  ## from `opName` (`futId`) so it cannot drift. Folding both seams into one place
+  ## writes the per-chunk close-drain guard — which `closeWait`'s "reject new ops"
+  ## invariant depends on — once, not hand-copied where tightening one could miss
+  ## the other.
+  ##
+  ## Non-`untyped` params are substituted at each use site, not bound once, so callers
+  ## must pass side-effect-free expressions (`f`/`buf`/`size`/`offset` are read
+  ## several times); both current callers pass plain symbols.
+  #
+  # Derived from the literal `opName` so the two seams cannot disagree; a `const` so
+  # it still satisfies `newFuture`'s `static string` (a runtime `let` would not).
+  const futId = "chronos_file." & opName & "Seekable"
+  #
+  # A negative offset has no positioned meaning — reject it here, the single guard
+  # for *both* backends, before the io_uring `uint64(offset)` cast in `wireRwSeam`.
+  # io_uring reads `(u64)-1` as "current file position" (WRITE advances it), silently
+  # diverging from `pread`/`pwrite` (which EINVAL) into a stale-position read /
+  # data-placement bug; rejecting before either backend makes both fail alike. Also
+  # catches a per-chunk `offset + written` that wrapped negative in a partial loop
+  # (unchecked builds only — checked builds OverflowDefect at the caller's add first;
+  # both need an ~8-EiB offset, unreachable). The implicit-offset path feeds
+  # `f.offset` (kept >= 0 by `setFilePos`), so it never fires there.
+  if offset < 0:
+    return failedFuture(
+      futId, newAsyncFileError("negative " & opName & " offset: " & $offset)
+    )
+  when uringCompiled:
+    # Only ring-eligible seekable fds go through io_uring. A non-seekable fd reaches a
+    # seam only via a misdirected positioned op (`*At` on a pipe/FIFO), whose contract
+    # is ESPIPE: the sync `pread`/`pwrite` below gives that, whereas an io_uring op on
+    # a pipe would *block* (no ESPIPE) and hang the rejection. Append writes are
+    # excluded the same way and fall through to the sync tail. Resolve the ring once
+    # here (skipped for an ineligible fd) and thread it into the seam.
+    let u =
+      if ringEligible:
+        uringInstance()
+      else:
+        nil
+    if not u.isNil:
+      when pinAppend:
+        # Append-carve-out tripwire: append has no write-at-end ring mode and must
+        # take the sync `write` tail (never suspends, never tracked). `ringEligible`
+        # (`... and not f.appendMode`) is the structural guarantee, so this never
+        # trips today — a debug-only guard catching a future change that routed append
+        # through the ring without wiring `trackSeekFut` (which would let `closeWait`
+        # close the fd with an append op still in flight against the caller's buffer).
+        assert not f.appendMode
+      # Re-check usability before submitting/tracking a *new* op: the refill loop and
+      # partial-write loops re-enter per chunk. Once `closeWait` set `f.closing` and
+      # snapshotted `seekFuts`, a leaf from a loop that resumed mid-drain would land
+      # outside the snapshot — `closeImpl` would then see it in flight and refuse to
+      # close (leaking the fd), and the deferred submit could reach a reused fd. The
+      # raw-proc entry guards only cover the first chunk; this per-chunk check is what
+      # makes `closeWait`'s "the seam rejects new ops" invariant hold.
+      #
+      # When the reject is `closeWait` draining (`f.closing`), surface a *cancellation*
+      # not an `AsyncFileError`: this chunk belongs to a caller op already in flight at
+      # snapshot time, so its awaiter is owed the `CancelledError` (like the siblings
+      # the drain cancels directly). chronos forbids `fail`-ing with `CancelledError`,
+      # hence `cancelAndSchedule`. A brand-new op started *after* `closeWait` is the
+      # different case the entry guards still reject with `AsyncFileError`.
+      if f.closing:
+        return cancelledFuture(futId)
+      let uerr = usabilityError(f)
+      if not uerr.isNil:
+        return failedFuture(futId, uerr)
+      let fut = uringSeam(u, cint(f.fd), buf, size, offset, context)
+      trackSeekFut(f, fut) # let close/closeWait drain it if still in flight
+      return fut
+  let syncFut = newFuture[int](futId)
+  try:
+    syncFut.complete(syncBody)
+  except AsyncFileError as e:
+    syncFut.fail(e)
+  return syncFut
+
 proc readSeekable*(
     f: AsyncFile, buf: pointer, size: int, offset: int64, context = ""
-): Future[int] {.async: (raises: [AsyncFileError]).} =
-  ## The single async seam for a *seekable* read: one `pread` of up to `size`
-  ## bytes into `buf` at the absolute `offset`, returning the bytes read
-  ## (0 = EOF).
+): Future[int] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
+  ## The single async seam for a *seekable* read: one read of up to `size` bytes
+  ## into `buf` at the absolute `offset`, returning the bytes read (0 = EOF).
   ##
   ## Offset-agnostic — it never touches `f.offset`; the caller owns all offset
   ## bookkeeping. Every seekable read in the library funnels through here
   ## (`readBuffer`/`readBufferAt` and `readLine`'s read-ahead refill), so this is
-  ## the one place to later swap the synchronous `pread` for an io_uring
-  ## submission.
+  ## the one place the backend is chosen.
   ##
-  ## Today it issues the syscall inline and completes immediately, so the
-  ## returned future is already finished when this returns: awaiting it does not
-  ## suspend the caller (chronos resumes synchronously past an already-finished
-  ## future), which preserves the invariant that seekable I/O never yields to the
-  ## dispatcher.
-  return doPread(cint(f.fd), buf, size, offset, context)
+  ## With the io_uring backend compiled in (`-d:chronosFileUring`) and usable here,
+  ## the read is submitted through io_uring and the future *suspends* until the CQE,
+  ## so it can be cancelled (draining the in-flight op first — see `uring_io`).
+  ## Otherwise a synchronous `pread` completes inline, so awaiting it never suspends
+  ## the caller and seekable I/O never yields to the dispatcher — the original behaviour.
+  seekableSeam(
+    f,
+    buf,
+    size,
+    offset,
+    context,
+    opName = "read",
+    pinAppend = false,
+    ringEligible = f.seekable,
+    uringSeam = uringReadSeam,
+    syncBody = doPread(cint(f.fd), buf, size, offset, context),
+  )
 
 proc writeSeekable*(
     f: AsyncFile, buf: pointer, size: int, offset: int64, context = ""
-): Future[int] {.async: (raises: [AsyncFileError]).} =
+): Future[int] {.async: (raw: true, raises: [AsyncFileError, CancelledError]).} =
   ## The single async seam for a *seekable* write: one write of up to `size`
   ## bytes from `buf`, returning the bytes written (> 0).
   ##
@@ -148,13 +254,41 @@ proc writeSeekable*(
   ## overwrite on POSIX-conforming platforms, appending only on Linux),
   ## otherwise a `pwrite` at the absolute `offset`. Offset-agnostic: it never
   ## touches `f.offset`, so the caller drives the partial-write loop and offset
-  ## bookkeeping. The companion of `readSeekable` and, like it, the one place to
-  ## later swap the synchronous syscall for an io_uring submission; today it
-  ## completes immediately, so awaiting it does not suspend the caller.
-  if f.appendMode:
-    return doWrite(cint(f.fd), buf, size, context)
-  else:
-    return doPwrite(cint(f.fd), buf, size, offset, context)
+  ## bookkeeping. The companion of `readSeekable`.
+  ##
+  ## With the io_uring backend compiled in and usable, a non-append write is
+  ## submitted through io_uring (suspends until the CQE, cancellable with
+  ## drain-on-cancel — see `uring_io`). Append-mode writes always take the
+  ## synchronous `write` path: io_uring's write needs an explicit offset and has
+  ## no "write at the current end" mode, so routing append through it would
+  ## reintroduce the stale-offset hazard the sequential `write` exists to avoid.
+  ## Without the backend (or when it is unusable) every write is the synchronous
+  ## syscall, completing immediately without suspending the caller.
+  ##
+  ## Because append never reaches the io_uring branch it never suspends and is never
+  ## registered with `trackSeekFut`, so `closeWait` has nothing to drain for it (a
+  ## large append can still block the loop — the sole carve-out in the "seekable
+  ## writes are async" story). Re-routing append onto the io_uring seam later must
+  ## also wire `trackSeekFut`, or the drain would silently miss it. The carve-out is
+  ## held structurally by `ringEligible` (`f.seekable and not f.appendMode`); the
+  ## `assert not f.appendMode` (the `pinAppend` arg) is a debug tripwire on top.
+  seekableSeam(
+    f,
+    buf,
+    size,
+    offset,
+    context,
+    opName = "write",
+    pinAppend = true,
+    ringEligible = f.seekable and not f.appendMode,
+    uringSeam = uringWriteSeam,
+    syncBody = (
+      if f.appendMode:
+        doWrite(cint(f.fd), buf, size, context)
+      else:
+        doPwrite(cint(f.fd), buf, size, offset, context)
+    ),
+  )
 
 proc refillReadBuf*(
     f: AsyncFile, chunkSize: int, alreadyGuarded: bool
@@ -175,8 +309,9 @@ proc refillReadBuf*(
   ##
   ## Cancellation / error safety: the buffer grows to `chunkSize` before the seam
   ## read (the sole suspension point). If that read aborts before committing — an
-  ## I/O error or a cancellation (reachable once io_uring can leave a read in
-  ## flight; the seam completes inline today) — the `finally` drops the grown,
+  ## I/O error, or a cancellation (reachable under the io_uring backend, which can
+  ## leave a read in flight; on the synchronous backend the seam completes inline,
+  ## so only an I/O error can abort here) — the `finally` drops the grown,
   ## zero-filled buffer back to empty with `f.offset` untouched. Since refill is
   ## only entered with the previous buffer consumed, that restores the exact
   ## pre-refill position (`getFilePos == offset - pushback`): no phantom zeros, no

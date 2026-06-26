@@ -73,6 +73,24 @@ suite "chronos_file: common (destructor & inert handle)":
     f.close()
     removeFile(path)
 
+suite "chronos_file: common (teardown invariant)":
+  test "hasInflightSeekOp is the shared in-flight predicate close/=destroy key off":
+    # The single condition `closeImpl` raises on and `=destroy` asserts is false.
+    # Pin its semantics directly: an empty set is never in flight (the state both
+    # teardown paths require), an unfinished entry is, and a settled one is not.
+    # Entries are never nil (created only by `addTracked`, dropped only by
+    # `removeTracked` — see `SeekFut`), so there is no nil case to cover. No event
+    # loop needed — building/settling a future is enough.
+    var futs: seq[SeekFut] = @[]
+    check not hasInflightSeekOp(futs) # empty -> nothing to drain
+
+    let pending = newFuture[int]("test.hasInflightSeekOp")
+    futs.add(SeekFut(fut: pending, idx: 0))
+    check hasInflightSeekOp(futs) # a suspended op -> in flight
+
+    pending.complete(0)
+    check not hasInflightSeekOp(futs) # settled -> closeImpl/=destroy may proceed
+
 suite "chronos_file: common (io_uring error)":
   # Pure synchronous helpers — no event loop or fd needed. They build the errno
   # -> AsyncFileError boundary the io_uring seam will use once iori is wired in,
@@ -82,6 +100,22 @@ suite "chronos_file: common (io_uring error)":
   test "uringResult returns the byte count for a non-negative result":
     check uringResult(0'i32) == 0 # EOF / zero-length write
     check uringResult(4096'i32, "readSeekable") == 4096
+
+  test "uringResult with zeroIsError maps a 0-byte write to AsyncFileOsError(EIO)":
+    # The write seam passes zeroIsError = true so a 0-byte CQE for a non-empty
+    # write becomes EIO, exactly as doPwrite/doWrite do: otherwise the caller's
+    # partial-write loop would spin forever on a write that never advances.
+    var code = OSErrorCode(0)
+    var msg = ""
+    try:
+      discard uringResult(0'i32, "writeSeekable", zeroIsError = true)
+    except AsyncFileOsError as e:
+      code = e.code
+      msg = e.msg
+    check code == EIO
+    check "writeSeekable" in msg # context prefixed, like doPwrite
+    # A positive count is still returned untouched even with the flag set.
+    check uringResult(4096'i32, "writeSeekable", zeroIsError = true) == 4096
 
   test "uringResult maps a negative result to AsyncFileOsError(-errno)":
     var raised = false
@@ -162,3 +196,34 @@ suite "chronos_file: common (io_uring error)":
     except CancelledError:
       cancelled = true
     check cancelled
+
+  # toAsyncFileError is the *returning* (never-raising) mapping shared by
+  # mapUringErrors and uring_io's failBridge (which must `fail` a raw future
+  # rather than `raise`). Tested directly here since it is a pure function.
+
+  test "toAsyncFileError maps an OSError to AsyncFileOsError preserving the code":
+    let mapped = toAsyncFileError(
+      (ref OSError)(errorCode: int32(EACCES), msg: "denied"), "writeSeekable"
+    )
+    check mapped of AsyncFileOsError
+    check (ref AsyncFileOsError)(mapped).code == EACCES
+    check "writeSeekable" in mapped.msg # context prefixed, like doPwrite
+
+  test "toAsyncFileError wraps a non-OS error as a bare AsyncFileError with context":
+    # iori's ring-lifecycle IOError has no errno, so it maps to the base type,
+    # not the OS-coded variant; the context is prefixed and the message kept.
+    let mapped =
+      toAsyncFileError(newException(IOError, "io_uring SQ full"), "writeSeekable")
+    check not (mapped of AsyncFileOsError)
+    check "writeSeekable" in mapped.msg
+    check "SQ full" in mapped.msg
+
+  test "toAsyncFileError returns an in-contract AsyncFileError unchanged":
+    # A failure already in chronos-file's hierarchy passes through by identity:
+    # neither re-wrapped, re-prefixed with the new context, nor downgraded.
+    let original = newAsyncFileOsError(EBADF, "readSeekable")
+    let mapped = toAsyncFileError(original, "writeSeekable")
+    check cast[pointer](mapped) == cast[pointer](original) # same object
+    check mapped of AsyncFileOsError
+    check (ref AsyncFileOsError)(mapped).code == EBADF
+    check "writeSeekable" notin mapped.msg # not re-prefixed

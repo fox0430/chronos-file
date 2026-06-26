@@ -9,6 +9,10 @@ import pkg/chronos/unittest2/asynctests
 import ../chronos_file
 import helpers
 
+when defined(chronosFileUring):
+  import ../chronos_file/uring_io # uringAvailable(): skip io_uring tests on fallback
+  import ../chronos_file/posix_handle # readSeekable/writeSeekable: per-chunk seam guard
+
 suite "chronos_file: posix_flush_close (flush, close, one-shot helpers)":
   teardown:
     checkLeaks()
@@ -213,6 +217,153 @@ suite "chronos_file: posix_flush_close (flush, close, one-shot helpers)":
     check rfut.cancelled()
     w.close()
     removeFile(path)
+
+  when defined(chronosFileUring):
+    asyncTest "closeWait drains an in-flight io_uring seekable read (B4)":
+      # On the io_uring backend a seekable read suspends on the CQE, so it can be
+      # in flight at close. closeWait must cancel and drain it (tracked via
+      # `seekFuts`) before closing the fd, so the read's awaiter sees a graceful
+      # CancelledError and the kernel is done with the buffer first — the seekable
+      # analog of the FIFO closeWait above.
+      if not uringAvailable():
+        skip() # backend compiled in but unusable here: no seekable op stays in flight
+        return
+      let path = tempPath(".bin")
+      block:
+        let g = openAsync(path, fmReadWrite)
+        await g.write(newSeq[byte](256 * 1024))
+        g.close()
+      let f = openAsync(path, fmReadWrite)
+      let rfut = f.read(256 * 1024) # suspends on the io_uring CQE
+      check not rfut.finished()
+      check f.seekFuts.len == 1 # tracked as the in-flight seekable op
+      await f.closeWait()
+      check f.isClosed
+      expect(CancelledError):
+        discard await rfut # the drained read surfaces as cancelled
+      removeFile(path)
+
+    asyncTest "closeWait drains every concurrent in-flight io_uring positioned op":
+      # Positioned `*At` ops take no offset slot, so several can be in flight at
+      # once. Each must be tracked (in `seekFuts`) and drained by closeWait — not
+      # just the most recently submitted: an undrained op's CQE would otherwise land
+      # in a caller buffer freed after the fd is closed (use-after-free). This is
+      # the regression guard for that single-slot gap.
+      if not uringAvailable():
+        skip() # backend compiled in but unusable here: ops complete synchronously
+        return
+      let path = tempPath(".bin")
+      block:
+        let g = openAsync(path, fmReadWrite)
+        await g.write(newSeq[byte](512 * 1024))
+        g.close()
+      let f = openAsync(path, fmReadWrite)
+      var b1 = newSeq[byte](256 * 1024)
+      var b2 = newSeq[byte](256 * 1024)
+      # Two positioned reads, launched without awaiting in between, so both suspend
+      # on the ring concurrently.
+      let f1 = f.readBufferAt(0, addr b1[0], b1.len)
+      let f2 = f.readBufferAt(256 * 1024, addr b2[0], b2.len)
+      check not f1.finished()
+      check not f2.finished()
+      check f.seekFuts.len == 2 # both tracked, neither overwritten by the other
+      await f.closeWait()
+      check f.isClosed
+      # Both ops were drained (settled) before the fd closed — neither was left in
+      # flight against a closed descriptor. The drain surfaces as cancellation; a
+      # sibling whose CQE lands during the first drain may instead complete normally
+      # (also safe — the kernel is then done with its buffer). Either way it must not
+      # have failed.
+      check f1.finished() and not f1.failed()
+      check f2.finished() and not f2.failed()
+      removeFile(path)
+
+    asyncTest "synchronous close with an in-flight io_uring op raises (use closeWait)":
+      # Synchronous `close` cannot await a drain, so rather than close the fd out
+      # from under a suspended io_uring op — risking a deferred-submit fd reuse or a
+      # write into a since-freed buffer — it refuses loudly and points the caller at
+      # `closeWait`, which cancels and drains first. (closeWait still reaches the
+      # shared close body, but only once every tracked op is finished.)
+      if not uringAvailable():
+        skip() # backend compiled in but unusable here: no seekable op stays in flight
+        return
+      let path = tempPath(".bin")
+      block:
+        let g = openAsync(path, fmReadWrite)
+        await g.write(newSeq[byte](256 * 1024))
+        g.close()
+      let f = openAsync(path, fmReadWrite)
+      let rfut = f.read(256 * 1024) # suspends on the io_uring CQE
+      check not rfut.finished()
+      check f.seekFuts.len == 1
+      expect(AsyncFileError):
+        f.close() # refused while the op is in flight
+      check not f.isClosed # nothing was closed out from under the op
+      # closeWait drains the op and closes gracefully; the read surfaces as cancelled.
+      await f.closeWait()
+      check f.isClosed
+      expect(CancelledError):
+        discard await rfut
+      removeFile(path)
+
+    asyncTest "a seam chunk re-entered once closeWait is draining is cancelled, not tracked":
+      # Regression guard for the closeWait drain race: closeWait snapshots
+      # `seekFuts`, then drains each entry. A multi-chunk write loop
+      # (`writeBufferSeekable`/`writeBufferAt`) or `readLine`'s refill loop that
+      # resumes *during* that drain — because an earlier sibling op completed
+      # naturally — would otherwise submit a fresh seam op and `trackSeekFut` it
+      # *outside* the snapshot. `closeImpl` would then see that untracked leaf still
+      # in flight and raise, which `closeWait` swallows: the fd is never closed (a
+      # leak), and the deferred submit could reach an already-closed/reused fd.
+      #
+      # The public procs all guard the *first* chunk at entry, but a resumed loop
+      # re-enters `readSeekable`/`writeSeekable` directly, so the per-chunk guard
+      # lives in the seam. Two things must hold:
+      #   1. the resubmit is refused (never tracked), so no leaf escapes the
+      #      snapshot — the fd-leak fix; and
+      #   2. it is refused as a *cancellation*, not an `AsyncFileError`: the chunk
+      #      belongs to one caller op already in flight when closeWait snapshotted,
+      #      so its awaiter is owed the `CancelledError` closeWait documents (like
+      #      the siblings the drain cancels directly). A brand-new op started after
+      #      closeWait is the different case the entry guards still reject with
+      #      `AsyncFileError`.
+      # Drive the seam directly with `f.closing` set (the exact state closeWait
+      # establishes before it suspends) to exercise both.
+      if not uringAvailable():
+        skip() # backend compiled in but unusable here: the seam never tracks an op
+        return
+      let path = tempPath(".bin")
+      block:
+        let g = openAsync(path, fmReadWrite)
+        await g.write(newSeq[byte](64 * 1024))
+        g.close()
+      let f = openAsync(path, fmReadWrite)
+      var buf = newSeq[byte](4096)
+
+      # Simulate the drain window: `closing` set, `seekFuts` already snapshotted.
+      f.closing = true
+      let wfut = writeSeekable(f, addr buf[0], buf.len, 0, "write")
+      expect(CancelledError):
+        discard await wfut # refused as a cancellation, not submitted
+      let rfut = readSeekable(f, addr buf[0], buf.len, 0, "read")
+      expect(CancelledError):
+        discard await rfut # refused as a cancellation, not submitted
+      check f.seekFuts.len == 0 # neither was tracked → closeImpl closes cleanly
+
+      # A brand-new public op in the same window still reports AsyncFileError, per
+      # closeWait's "new operations are rejected with AsyncFileError" clause — the
+      # entry guards, not the seam's `f.closing` branch.
+      expect(AsyncFileError):
+        discard await f.readAt(0, 4)
+      expect(AsyncFileError):
+        await f.writeAt(0, @[byte 1])
+
+      # Clear the simulated flag and close for real (no op is in flight, so the
+      # drain is empty and the fd is actually released — no leak).
+      f.closing = false
+      await f.closeWait()
+      check f.isClosed
+      removeFile(path)
 
   asyncTest "close during a closeWait drain is a no-op (graceful contract)":
     let path = tempPath(".fifo")

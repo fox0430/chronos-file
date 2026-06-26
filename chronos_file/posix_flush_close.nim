@@ -34,7 +34,7 @@ else:
   ): Future[void] {.async: (raises: [AsyncError, CancelledError]).} =
     discard
 
-import common, posix_handle, posix_io
+import common, posix_handle, posix_io, uring_io
 
 {.push raises: [].}
 
@@ -164,11 +164,12 @@ proc flush*(
     f: AsyncFile, kind = flushFull
 ): Future[void] {.async: (raises: [AsyncFileError]).} =
   ## Flushes buffered file data to the storage device (`fsync`, or `fdatasync`
-  ## when `kind == flushDataOnly`). The sync runs on a dedicated worker thread, so — unlike
-  ## regular-file reads/writes — it does **not** block the event loop; other
-  ## tasks keep running while the kernel writes back. Non-seekable fds
-  ## (pipes/FIFOs/ttys) cannot be synced and fail with EINVAL — they are
-  ## rejected up-front, before any worker thread is spawned.
+  ## when `kind == flushDataOnly`). It does **not** block the event loop — under
+  ## the io_uring backend (`-d:chronosFileUring`, when usable) the sync is an
+  ## io_uring fsync; otherwise it runs on a dedicated worker thread. Either way
+  ## other tasks keep running while the kernel writes back. Non-seekable fds
+  ## (pipes/FIFOs/ttys) cannot be synced and fail with EINVAL — they are rejected
+  ## up-front, before any worker thread or io_uring op is set up.
   ##
   ## The worker syncs a `dup` of the descriptor (durability is a property of
   ## the file, not the descriptor), so calling `close`/`closeWait` while a
@@ -204,9 +205,28 @@ proc flush*(
   if dupFd == -1:
     raise newAsyncFileOsError(osLastError(), "flush")
 
-  # Keep the worker's private fd out of child processes, mirroring openAsync's
-  # O_CLOEXEC. Best-effort.
+  # Keep the private fd out of child processes, mirroring openAsync's O_CLOEXEC.
+  # Best-effort.
   discard setDescriptorInheritance(dupFd, false)
+
+  when uringCompiled:
+    # Resolve the thread-local ring once and thread it into `uringFsyncSeam`,
+    # rather than probing in `uringAvailable()` and again inside the seam. `flush`
+    # already rejected non-seekable fds above, so an unconditional probe is fine.
+    let u = uringInstance()
+    if not u.isNil:
+      # io_uring fdatasync/fsync on the dup. The dup is still the barrier (A6): iori
+      # submits via a deferred `callSoon` batch, so a raw fd could be closed — and
+      # reused — before `io_uring_enter` resolves it, fsyncing an unrelated file. The
+      # dup sidesteps that and lets close/closeWait run during the flush. `noCancel`
+      # because an in-progress fsync can't be aborted; the dup stays alive until the
+      # seam settles, then `finally` closes it (the CQE is already reaped).
+      try:
+        discard await noCancel(uringFsyncSeam(u, dupFd, kind == flushDataOnly, "flush"))
+      finally:
+        discard closeFd(dupFd)
+      return
+
   let signal = ThreadSignalPtr.new().valueOr:
     discard closeFd(dupFd)
     raise newAsyncFileError("flush: cannot create completion signal: " & error)
@@ -245,12 +265,27 @@ proc closeImpl(f: AsyncFile) {.raises: [AsyncFileError].} =
   ## (the public `close` adds that guard).
   ##
   ## Only the non-seekable EAGAIN futures (`readFut`/`writeFut`) are drained here.
-  ## A seekable op completes synchronously today, so `seekOpInFlight` is never set
-  ## at close and there is nothing seekable to drain. Once the seam suspends
-  ## (io_uring) a suspended seekable op will need a cancellable future tracked and
-  ## drained here — see `IO_URING_TODO.md` (A4/B4).
+  ## A synchronous-backend seekable op completes inline, so nothing seekable is ever
+  ## in flight at `close`. Under io_uring a seekable op *can* be suspended (tracked in
+  ## `seekFuts`); synchronous `close` cannot await its drain, and closing the fd while
+  ## one is merely queued risks a deferred-submit fd-reuse (the hazard `flush` dups
+  ## around) and a write into a since-released buffer. With no safe synchronous
+  ## recovery it **raises** `AsyncFileError` when any tracked op is in flight — the
+  ## caller must use `closeWait`, which drains first (and reaches this body only once
+  ## every tracked future is `finished`, so the guard never fires for it).
   if not f.opened or f.closed:
     return
+
+  when uringCompiled:
+    # Refuse a synchronous close that would strand an in-flight io_uring op (see the
+    # docstring). No-op on the synchronous backend (`seekFuts` always empty); under
+    # `closeWait` every tracked op is already `finished` here, so the check passes.
+    # `=destroy` asserts the negation of this same condition.
+    if hasInflightSeekOp(f.seekFuts):
+      raise newAsyncFileError(
+        "close: an io_uring seekable op is still in flight; use closeWait to " &
+          "cancel and drain it (synchronous close cannot await the drain)"
+      )
 
   f.closed = true
   if not f.readFut.isNil and not f.readFut.finished():
@@ -293,6 +328,12 @@ proc close*(f: AsyncFile) {.raises: [AsyncFileError].} =
   ## If a `read`/`write` is still in flight (pipe/FIFO EAGAIN path), its future
   ## is failed rather than left pending forever; the caller should still avoid
   ## closing while operations are outstanding.
+  ##
+  ## Under the io_uring backend an in-flight *seekable* op cannot be drained
+  ## synchronously, so closing while one is outstanding raises `AsyncFileError`
+  ## instead — closing the fd anyway would risk a deferred-submit fd-reuse or a
+  ## write into a since-released buffer. Use `closeWait` for such handles; it
+  ## cancels and drains every in-flight op before closing.
   ##
   ## Idempotent: a second `close` is a no-op, so the underlying fd (which may
   ## have been reused) is never closed twice. A `close` issued while a
@@ -339,6 +380,26 @@ proc closeWait*(f: AsyncFile): Future[void] {.async: (raises: []).} =
     await f.readFut.cancelAndWait()
   if not f.writeFut.isNil and not f.writeFut.finished():
     await f.writeFut.cancelAndWait()
+  # And every in-flight io_uring seekable op (empty on the synchronous backend). Each
+  # `cancelAndWait` drives the drain-on-cancel wrapper: it issues ASYNC_CANCEL and
+  # waits for the real CQE, so the kernel is done with that op's buffer before the fd
+  # closes below. Concurrent positioned `*At` ops each have their own entry, so all
+  # are drained, not just the most recent. Snapshot the seq first — each op's settle
+  # callback removes its own entry, so iterating the live seq would skip ops. Issue
+  # every cancel up front and `allFutures` them so the N drains overlap (safe: a
+  # sibling whose CQE lands during another's drain just completes normally). Awaiters
+  # see `CancelledError`. New ops can't join: `f.closing` is set, so the seam rejects
+  # them — and a multi-chunk sibling that resumes mid-drain and resubmits gets a
+  # `CancelledError` too, not an `AsyncFileError` (see the `f.closing` branch in
+  # `readSeekable`/`writeSeekable`). `noCancel` stops a cancel of `closeWait` itself
+  # from interrupting the drain.
+  let pending = f.seekFuts
+  var drains: seq[Future[void]]
+  for s in pending:
+    if s.isInflight():
+      drains.add(s.fut.cancelAndWait())
+  if drains.len > 0:
+    await noCancel allFutures(drains)
   try:
     # Call the shared body directly: the public `close` is a no-op while
     # `f.closing` is set (by design, to protect this drain from a concurrent

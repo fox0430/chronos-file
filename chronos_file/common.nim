@@ -11,6 +11,17 @@ import pkg/chronos/[osutils, oserrno]
 {.push raises: [].}
 
 type
+  SeekFut* = ref object
+    ## One tracked in-flight io_uring *seekable* seam op (see `addTracked`). Wraps
+    ## the seam future with `idx`, its *current* slot in `AsyncFileObj.seekFuts`.
+    ## `addTracked`/`removeTracked` are the seq's only mutators and keep `idx` in
+    ## sync as siblings swap-remove, so a settling op excises its own entry in O(1)
+    ## by `idx` rather than an O(n) scan — a batch settle is O(n), not O(n^2). Never
+    ## nil and never holds a nil `fut` (created only by `addTracked`, dropped only by
+    ## `removeTracked`), so consumers (`isInflight`/`closeWait`) need no nil guard.
+    fut*: FutureBase
+    idx*: int
+
   AsyncFileObj* = object
     fd*: AsyncFD
     offset*: int64
@@ -32,6 +43,16 @@ type
       ## EAGAIN path). Tracked so `close` can fail it instead of leaking it.
     writeFut*: Future[void]
       ## In-flight `writeBuffer` future while it waits on `addWriter2`.
+    seekFuts*: seq[SeekFut]
+      ## In-flight io_uring *seekable* seam futures (populated only under
+      ## `-d:chronosFileUring`; always empty on the synchronous backend). Tracks
+      ## *every* suspended seekable read/write so `closeWait` can drain them all
+      ## before closing the fd — the seekable analog of `readFut`/`writeFut`. Mutated
+      ## only via `addTracked`/`removeTracked` (O(1) removal; see `SeekFut`).
+      ## Implicit-offset ops are single-in-flight (`seekOpInFlight`), but concurrent
+      ## positioned `*At` ops take no slot, so each gets its own entry and `closeWait`
+      ## drains all of them. Synchronous `close`/`=destroy` cannot await a drain, so a
+      ## handle with an op in flight must be closed with `closeWait` (see `closeImpl`).
     seekOpInFlight*: bool
       ## Single in-flight slot for the *seekable* implicit-offset family
       ## (`read`/`write`/`readLine` and compound forms, which share `offset`):
@@ -146,100 +167,197 @@ proc newAsyncFileIncompleteError*(msg: string): ref AsyncFileIncompleteError =
 proc newAsyncFileLimitError*(msg: string): ref AsyncFileLimitError =
   (ref AsyncFileLimitError)(msg: msg)
 
+template failedFuture*(name: string, err: ref AsyncFileError): untyped {.dirty.} =
+  ## A fresh `int` seam future (named `name`) already failed with `err`: the
+  ## allocate / settle / return idiom the raw-future seams reject ops with, folded
+  ## into one place.
+  ##
+  ## `{.dirty.}` on purpose: chronos' `newFuture` keys off
+  ## `InternalRaisesFutureRaises`, a type the `async` macro injects into the
+  ## *calling* proc's body, so only a dirty template resolves it (and `newFuture`/
+  ## `fail`) in the expansion scope — hence this must be spliced into a raw-async
+  ## proc body, and the `untyped` result carries that proc's exact future type.
+  ## `name` reaches `newFuture` as the `static string` it needs because the template
+  ## substitutes the literal.
+  block:
+    let rejectedFut = newFuture[int](name)
+    rejectedFut.fail(err)
+    rejectedFut
+
+template cancelledFuture*(name: string): untyped {.dirty.} =
+  ## A fresh `int` seam future (named `name`) already scheduled for cancellation:
+  ## the seam's "reject an in-flight op's chunk while `closeWait` drains" outcome.
+  ## `cancelAndSchedule` because chronos forbids `fail`-ing with `CancelledError`.
+  ## `{.dirty.}` for the same reason as `failedFuture` (see it).
+  block:
+    let cancelledFut = newFuture[int](name)
+    cancelledFut.cancelAndSchedule()
+    cancelledFut
+
 # io_uring (iori) error boundary
-# Groundwork for the planned io_uring backend. The seekable seam in
-# `posix_handle` will later `await` iori bridge futures of type
-# `Future[int32]`, which report failures in two shapes that must never escape
-# chronos-file's public API. Both are funneled through here:
-#   * a CQE result `< 0` is `-errno` and becomes `AsyncFileOsError` (carrying the
+# The seekable seam awaits iori bridge futures of type `Future[int32]`, whose
+# failures must never escape the public API. Funneled through here:
+#   * a CQE result `< 0` is `-errno` -> `AsyncFileOsError` (carrying the
 #     `OSErrorCode`), matching the `doPread`/`doPwrite` contract;
 #   * a raw `IOError` (ring closed / SQ full) or `OSError` thrown when the op
-#     cannot even be queued becomes `AsyncFileError` / `AsyncFileOsError`.
-# Kept next to the error constructors and deliberately free of any iori import,
-# so it compiles and is tested before iori is a dependency (`IOError`/`OSError`
-# are stdlib types). If iori later reports typed errors the wrapper collapses to
-# just `uringResult` — but that is an iori-side change and is out of scope here.
+#     cannot even be queued -> `AsyncFileError` / `AsyncFileOsError`.
+# Deliberately free of any iori import (uses stdlib `IOError`/`OSError`), so it
+# compiles and is tested independently. If iori later reports typed errors this
+# collapses to just `uringResult`.
 
-proc uringResult*(res: int32, context = ""): int {.raises: [AsyncFileOsError].} =
-  ## Translate an io_uring CQE result into chronos-file's contract: a negative
-  ## value is `-errno` and is raised as `AsyncFileOsError` (preserving the
-  ## `OSErrorCode`); a non-negative value is the byte count and is returned
-  ## unchanged. `context` prefixes the message with the operation name, exactly
-  ## as `doPread`/`doPwrite` do. Covers every CQE result iori can produce (an
-  ## `-errno`, which always fits an `OSErrorCode`, or a byte count) and is the
-  ## single place the `res < 0 -> newAsyncFileOsError(OSErrorCode(-res))` rule
-  ## lives.
+proc uringResult*(
+    res: int32, context = "", zeroIsError = false
+): int {.raises: [AsyncFileOsError].} =
+  ## Translate an io_uring CQE result into the contract: a negative value is
+  ## `-errno`, raised as `AsyncFileOsError` (preserving the `OSErrorCode`); a
+  ## non-negative value is the byte count, returned unchanged. `context` prefixes
+  ## the message like `doPread`/`doPwrite`. The single place the `res < 0` rule lives.
   ##
-  ## Cancellation is *not* decoded here: a low-level `-ECANCELED` is only how
-  ## iori settles its own bridge future, and the seam keeps the public future
-  ## pending and drives chronos cancellation instead, so it does not reach
-  ## this mapping in normal flow.
+  ## `zeroIsError` mirrors `doPwrite`/`doWrite` for the *write* seam: a 0-byte write
+  ## of a non-empty request can't make progress, so the caller's partial-write loop
+  ## would spin forever re-submitting it — turn it into `EIO`. Reads (0 = EOF) and
+  ## fsync (0 = success) leave it `false`.
+  ##
+  ## Cancellation is not decoded here: a `-ECANCELED` is only how iori settles its
+  ## own bridge future; the seam drives chronos cancellation and keeps the public
+  ## future pending, so it never reaches this mapping in normal flow.
   if res < 0:
     # Negate in `int`, not `int32`: `-res` would overflow for `res == low(int32)`
-    # (`OverflowDefect`). Every real `-errno` is small and fits an `OSErrorCode`;
-    # widening just keeps the arithmetic defensive for an unreachable input.
+    # (`OverflowDefect`). This only defends the *negation*; the `OSErrorCode`
+    # (int32-backed) conversion below would still `RangeDefect` on that same
+    # `low(int32)`, since `2147483648` does not fit. That is acceptable because the
+    # input is unreachable: every real `-errno` is small and fits an `OSErrorCode`.
     raise newAsyncFileOsError(OSErrorCode(-res.int), context)
+  elif res == 0 and zeroIsError:
+    raise newAsyncFileOsError(oserrno.EIO, context)
   int(res)
 
-template mapUringErrors*(context: string, body: untyped): untyped =
-  ## Run `body` (typically an `await` on an iori bridge future followed by
-  ## `uringResult` decoding) with iori's internal failure types translated into
-  ## chronos-file's public hierarchy, so neither `IOError` nor `OSError` ever
-  ## leaks past the public API:
-  ##   * `OSError` -> `AsyncFileOsError` (its `errorCode` becomes the OSErrorCode);
-  ##   * `IOError`  -> `AsyncFileError` (no errno: an internal-state failure such
-  ##     as a closed ring or a full submission queue).
-  ## `AsyncFileError` (already in-contract, e.g. raised by `uringResult` inside
-  ## `body`) and `CancelledError` propagate untouched — they are caught by
-  ## neither branch, so this layer leaves the seam's cancellation handling alone.
+proc toAsyncFileError*(err: ref CatchableError, context = ""): ref AsyncFileError =
+  ## Map an iori-side *exception* onto the public hierarchy and *return* it (never
+  ## raises), so a caller that cannot `raise` past its control flow can settle a raw
+  ## future with it (`uring_io.failBridge`); `mapUringErrors` re-raises it. The
+  ## exception-shaped sibling of `uringResult`.
+  ##   * an in-contract `AsyncFileError` (e.g. raised by `uringResult` in the body)
+  ##     passes through unchanged — never double-wrapped nor downgraded. Checked
+  ##     first; its order vs the `OSError` branch is immaterial (never both match).
+  ##   * `OSError` -> `AsyncFileOsError`, `errorCode` preserved (newAsyncFileOsError
+  ##     prefixes `context`).
+  ##   * anything else (iori's ring-lifecycle `IOError` for closed ring / full SQ,
+  ##     plus residual) -> a bare `AsyncFileError`, with `context` prefixed.
   ##
-  ## SQ-full backpressure is iori's responsibility, not a retry loop here:
-  ## matching on the message string would be brittle, would reorder submissions
-  ## and break linked chains. This layer only guarantees the failure is surfaced
-  ## in-contract.
-  try:
-    body
-  except OSError as osErr:
-    raise newAsyncFileOsError(OSErrorCode(osErr.errorCode), context)
-  except IOError as ioErr:
-    # Bind `context` once: it is a typed template parameter, so each textual use
-    # re-evaluates the argument expression (`context.len` and `context & ": "`
-    # would evaluate it twice).
-    let ctx = context
+  ## `CancelledError` is not handled here: cancellation is the seam's to drive, so
+  ## `mapUringErrors` re-raises it first and `failBridge` only sees a non-cancel
+  ## failure.
+  if err of AsyncFileError:
+    (ref AsyncFileError)(err)
+  elif err of OSError:
+    newAsyncFileOsError(OSErrorCode((ref OSError)(err).errorCode), context)
+  else:
     let prefix =
-      if ctx.len > 0:
-        ctx & ": "
+      if context.len > 0:
+        context & ": "
       else:
         ""
-    raise newAsyncFileError(prefix & ioErr.msg)
+    newAsyncFileError(prefix & err.msg)
+
+template mapUringErrors*(context: string, body: untyped): untyped =
+  ## Run `body` (typically `await` on an iori bridge future + `uringResult`) with
+  ## iori's failure types translated into the public hierarchy. The handler is
+  ## *total*: every `CatchableError` is narrowed to `AsyncFileError`/`CancelledError`,
+  ## which is what lets an `await` on iori's untyped `Future[int32]` (inferred
+  ## `raises: [CatchableError]`) satisfy a seam's
+  ## `raises: [AsyncFileError, CancelledError]` — see `uringFsyncSeam`.
+  ##   * `CancelledError` re-raised unchanged (the seam's to drive).
+  ##   * everything else mapped by `toAsyncFileError` and re-raised — the same
+  ##     mapping `failBridge` uses.
+  ##
+  ## SQ-full backpressure is iori's job, not a retry loop here: matching the message
+  ## string would be brittle and reorder submissions / break linked chains.
+  try:
+    body
+  except CancelledError as cancelErr:
+    raise cancelErr
+  except CatchableError as err:
+    raise toAsyncFileError(err, context)
+
+proc addTracked*(seekFuts: var seq[SeekFut], fut: FutureBase): SeekFut =
+  ## Append `fut` and return its `SeekFut` entry, recording its slot index so
+  ## `removeTracked` can excise it in O(1). These two are the *only* mutators of a
+  ## `seekFuts` seq — what keeps the `idx`-equals-slot invariant (see `SeekFut`). The
+  ## caller arms `entry`'s settle callback to call `removeTracked` (see `trackSeekFut`).
+  result = SeekFut(fut: fut, idx: seekFuts.len)
+  seekFuts.add(result)
+
+proc removeTracked*(seekFuts: var seq[SeekFut], entry: SeekFut) =
+  ## Swap-remove `entry` in O(1) by its carried index: `swap` with the tail (no
+  ## refcount churn), fix the moved entry's `idx`, drop the tail. `entry` must still
+  ## be tracked — its settle callback fires once while it is, so `idx` is a live slot.
+  ## The `doAssert` turns any violation (a third mutator, a double-track, a stale
+  ## callback) into a loud failure instead of a silent out-of-bounds write, and
+  ## survives `-d:danger` like the `=destroy` UAF net.
+  let i = entry.idx
+  let last = seekFuts.high
+  doAssert i in 0 .. last,
+    "SeekFut.idx out of sync with seekFuts (len " & $seekFuts.len & ")"
+  if i != last:
+    swap(seekFuts[i], seekFuts[last])
+    seekFuts[i].idx = i
+  seekFuts.setLen(last)
+
+proc isInflight*(s: SeekFut): bool {.inline.} =
+  ## A tracked seekable op is in flight iff its seam future is still suspended. `s`/
+  ## `s.fut` are never nil (see `SeekFut`), so this is just the finished test — the
+  ## per-entry liveness predicate both teardown paths share (`hasInflightSeekOp` and
+  ## the `closeWait` drain) so they cannot drift.
+  not s.fut.finished()
+
+proc hasInflightSeekOp*(seekFuts: seq[SeekFut]): bool =
+  ## True iff any op in `seekFuts` is still suspended (`isInflight`). The single
+  ## condition both teardown paths reason about, shared so they cannot diverge:
+  ##   * `closeImpl` **raises** `AsyncFileError` — synchronous `close` can't await
+  ##     the drain, and closing the fd under a live op risks a deferred-submit
+  ##     fd-reuse / a write into a since-released buffer.
+  ##   * `=destroy` **asserts** it is false — likewise can't await, and by the
+  ##     reachability invariant (iori roots the bridge future until the CQE is
+  ##     reaped) it only runs once every tracked op has settled.
+  ## Trivially false on the synchronous backend, where `seekFuts` stays empty.
+  for s in seekFuts:
+    if s.isInflight():
+      return true
 
 proc `=destroy`(f: AsyncFileObj) =
-  ## Best-effort safety net for a forgotten `close`: release the descriptor
-  ## (and, for non-seekable fds, its dispatcher registration). Prefer an
-  ## explicit `close`/`closeWait`; do not rely on this. While a pipe/FIFO
-  ## read/write is in flight the dispatcher holds the readiness callback (which
-  ## captures this handle), so the handle stays reachable and this destructor
-  ## will not run until the op settles — but do not depend on that ordering:
-  ## close such handles explicitly with `closeWait`, which cancels and drains
-  ## in-flight ops first. The destructor itself neither fails nor cancels a
-  ## pending future, so were it ever to run with one outstanding, a queued
-  ## readiness callback could touch a freed descriptor/buffer.
+  ## Best-effort safety net for a forgotten `close`: release the fd (and, for
+  ## non-seekable fds, its dispatcher registration). Prefer `close`/`closeWait`.
+  ## While an op is in flight the handle stays reachable, so this won't run until it
+  ## settles (a pipe/FIFO read/write is held by the dispatcher's readiness callback;
+  ## an io_uring seekable op by its `seekFuts` settle callback, via iori's bridge
+  ## future — both capture this handle). Don't depend on that ordering, though: the
+  ## destructor can neither fail nor cancel a pending future, so rather than trust
+  ## the invariant silently it **asserts** no io_uring seekable op is in flight
+  ## (`hasInflightSeekOp`), mirroring `closeImpl` which raises on the same state.
   ##
-  ## The dispatcher registration is thread-local state, so this safety net is
-  ## only safe when the destructor runs on the thread that owns the dispatcher
-  ## the fd was registered with, while that dispatcher is still alive. A
-  ## handle whose last reference is dropped on another thread, or after the
-  ## event loop has shut down, is outside that window — one more reason to
-  ## close explicitly instead of relying on this.
+  ## The dispatcher registration is thread-local, so this is only safe when the
+  ## destructor runs on the dispatcher-owning thread while that dispatcher is alive.
+  ## A handle dropped on another thread or after loop shutdown is outside that
+  ## window — one more reason to close explicitly.
   ##
-  ## Only acts on a handle that a real constructor opened: a
-  ## default-constructed `AsyncFile()` has `opened == false` and owns no fd, so
-  ## it must not touch fd 0 (stdin) or unregister an fd that was never
-  ## registered (which would abort in the dispatcher).
+  ## Only acts on a handle a real constructor opened: a default `AsyncFile()` has
+  ## `opened == false` and owns no fd, so it must not touch fd 0 or unregister an
+  ## fd that was never registered (which would abort in the dispatcher).
   if f.opened and not f.closed:
+    # No tracked io_uring op can be in flight here (reachability invariant above).
+    # Assert rather than trust silently: were it broken (ring torn down, reachability
+    # lost), closing the fd and freeing the buffers below would be a UAF under a live
+    # kernel op. `doAssert` survives `-d:danger` (the point of a UAF net); the check
+    # is once-per-handle and empty on the synchronous backend.
+    doAssert not hasInflightSeekOp(f.seekFuts),
+      "=destroy ran with an io_uring seekable op still in flight; the handle was " &
+        "collected under a live kernel op — close such handles with closeWait"
+
     if not f.seekable:
       discard unregister2(f.fd)
     discard closeFd(cint(f.fd))
+
   # A custom `=destroy` suppresses the compiler's automatic field destruction,
   # so the GC-managed fields must be released by hand or their refs/seq would
   # leak. The `Future` destructor is inferred as possibly-raising, but a
@@ -250,3 +368,4 @@ proc `=destroy`(f: AsyncFileObj) =
     `=destroy`(f.rbuf)
     `=destroy`(f.readFut)
     `=destroy`(f.writeFut)
+    `=destroy`(f.seekFuts)

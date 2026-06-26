@@ -8,7 +8,12 @@ from std/posix import mkfifo, Mode
 import pkg/chronos/unittest2/asynctests
 
 import ../chronos_file
+import
+  ../chronos_file/posix_handle # readSeekable/writeSeekable: the seam's offset guard
 import helpers
+
+when defined(chronosFileUring):
+  import ../chronos_file/uring_io # uringAvailable(): skip io_uring tests on fallback
 
 suite "chronos_file: posix_io (read/write surface)":
   teardown:
@@ -348,31 +353,75 @@ suite "chronos_file: posix_io (read/write surface)":
         failed = true
       check failed
 
-  asyncTest "seekable readLine completes synchronously (no cancellation point today)":
-    # White-box (mirrors test_buffer_ownership.nim / A4): the refill's `pread`
-    # completes inline today, so a seekable readLine never suspends — its future is
-    # already finished before it is awaited, leaving no point at which a cancel
-    # could tear a refill. `refillReadBuf`'s cancel rollback is thus unreachable
-    # until the io_uring seam can leave a refill in flight; this check flips then.
-    let path = tempPath(".txt")
-    let f = openAsync(path, fmReadWrite)
-    # A first line longer than one 4096-byte chunk forces a multi-refill read;
-    # all of it stays synchronous, so the future is still finished on return.
-    let first = "a".repeat(5000)
-    await f.write(first & "\n" & "second\n")
-    f.setFilePos(0)
+  when defined(chronosFileUring):
+    asyncTest "seekable readLine suspends on refill and rolls back on cancel":
+      # io_uring backend (A4): the refill now suspends on the CQE, so a seekable
+      # readLine is no longer finished on return. The genuinely new arm of
+      # `refillReadBuf`'s rollback — drop the grown rbuf, leave `f.offset`, release
+      # the offset slot — is now reachable via a *real* cancellation, not only the
+      # error arm the sync-backend test could cover.
+      if not uringAvailable():
+        skip() # backend compiled in but unusable here: seam stays synchronous
+        return
+      let path = tempPath(".txt")
+      let f = openAsync(path, fmReadWrite)
+      let first = "a".repeat(5000) # > one 4096 chunk: forces a multi-refill read
+      await f.write(first & "\n" & "second\n")
+      f.setFilePos(0)
 
-    block:
-      let fut = f.readLine()
-      check fut.finished() # consumed across refills without ever suspending
-      check (await fut) == Opt.some(first)
-    block:
-      let fut = f.readLine()
-      check fut.finished()
-      check (await fut) == Opt.some("second")
+      block:
+        let fut = f.readLine()
+        check not fut.finished() # the refill suspends now
+        check (await fut) == Opt.some(first)
+      check not f.seekOpInFlight # slot released after the op
+      # The second line was already pulled into the read-ahead by the last refill
+      # above, so it is served from `rbuf` without a new refill — hence it may well
+      # finish synchronously; only its content matters here.
+      check (await f.readLine()) == Opt.some("second")
 
-    f.close()
-    removeFile(path)
+      # Cancel a readLine while its refill is in flight: the rollback restores the
+      # pre-refill position and releases the slot, so the handle stays usable.
+      f.setFilePos(0)
+      block:
+        let fut = f.readLine()
+        check not fut.finished()
+        await fut.cancelAndWait()
+        check fut.cancelled()
+      check not f.seekOpInFlight # offset slot released on the way out
+      check f.rbuf.len == 0 # grown refill buffer dropped
+      check f.getFilePos() == 0 # offset untouched -> position preserved
+
+      # The handle is still consistent: the next readLine re-reads from the start.
+      check (await f.readLine()) == Opt.some(first)
+
+      f.close()
+      removeFile(path)
+  else:
+    asyncTest "seekable readLine completes synchronously (no cancellation point today)":
+      # White-box (mirrors test_buffer_ownership.nim / A4): the refill's `pread`
+      # completes inline today, so a seekable readLine never suspends — its future is
+      # already finished before it is awaited, leaving no point at which a cancel
+      # could tear a refill. `refillReadBuf`'s cancel rollback is thus unreachable
+      # until the io_uring seam can leave a refill in flight; this check flips then.
+      let path = tempPath(".txt")
+      let f = openAsync(path, fmReadWrite)
+      # A first line longer than one 4096-byte chunk forces a multi-refill read;
+      # all of it stays synchronous, so the future is still finished on return.
+      let first = "a".repeat(5000)
+      await f.write(first & "\n" & "second\n")
+      f.setFilePos(0)
+
+      block:
+        let fut = f.readLine()
+        check fut.finished() # consumed across refills without ever suspending
+        check (await fut) == Opt.some(first)
+      block:
+        let fut = f.readLine()
+        check fut.finished()
+        check (await fut) == Opt.some("second")
+
+      f.close()
+      removeFile(path)
 
   asyncTest "a failed mid-line refill rolls back to the pre-refill position":
     # White-box: a buffered chunk holds a partial line with no terminator, so
@@ -880,6 +929,84 @@ suite "chronos_file: posix_io (read/write surface)":
     # The handle stays usable and the position untouched.
     f.setFilePos(0)
     check (await f.read(3)) == @[byte 1, 2, 3]
+    f.close()
+    removeFile(path)
+
+  asyncTest "positioned procs reject a negative offset":
+    # A negative offset has no positioned meaning. The sync pread/pwrite reject it
+    # with EINVAL, but the io_uring seam casts it to uint64 and offset -1 ==
+    # (u64)-1 means "use the current file position" to io_uring READ/WRITE —
+    # silently diverging (a data-placement bug for writes). All four positioned
+    # entry points must fail with AsyncFileError before reaching either backend.
+    let path = tempPath(".bin")
+    let f = openAsync(path, fmReadWrite)
+    await f.write(@[byte 1, 2, 3])
+    var dummy: byte
+    template rejects(body: untyped) =
+      var failed = false
+      try:
+        body
+      except AsyncFileError:
+        failed = true
+      check failed
+
+    rejects:
+      discard await f.readBufferAt(-1, addr dummy, 1)
+    rejects:
+      await f.writeBufferAt(-1, addr dummy, 1)
+    rejects:
+      discard await f.readAt(-1, 1)
+    rejects:
+      await f.writeAt(-1, @[byte 9])
+    # A zero-size positioned op never positions, so the offset is unused and a
+    # negative one stays a no-op (consistent with the high-level empty-op path).
+    check (await f.readBufferAt(-1, addr dummy, 0)) == 0
+    await f.writeBufferAt(-1, addr dummy, 0)
+    # The handle stays usable and the bytes are untouched.
+    f.setFilePos(0)
+    check (await f.read(3)) == @[byte 1, 2, 3]
+    f.close()
+    removeFile(path)
+
+  asyncTest "the seekable seam itself rejects a negative offset (cast guard)":
+    # The dangerous `uint64(offset)` cast lives in the io_uring seam; a negative
+    # offset reaching it would become (u64)-1 == "use the current file position".
+    # The guard is consolidated in the seam (`readSeekable`/`writeSeekable`), not
+    # replicated in the positioned callers, so a *direct* seam call — and a
+    # per-chunk `offset + written` that overflows int64 to negative inside a
+    # partial-write loop — is rejected before either backend casts. Drive the seam
+    # directly to lock that in (runs on both backends: the guard precedes the
+    # `when uringCompiled` dispatch).
+    let path = tempPath(".bin")
+    let f = openAsync(path, fmReadWrite)
+    await f.write(@[byte 1, 2, 3])
+    var dummy: byte
+
+    block:
+      var failed = false
+      try:
+        discard await readSeekable(f, addr dummy, 1, -1, "readAt")
+      except AsyncFileError:
+        failed = true
+      check failed
+    block:
+      var failed = false
+      try:
+        discard await writeSeekable(f, addr dummy, 1, -1, "writeAt")
+      except AsyncFileError:
+        failed = true
+      check failed
+    # The wrapped-negative offset a partial loop would compute (`high(int64)`
+    # plus a positive chunk count) is the same negative input, so the seam turns
+    # it away identically — no leaf reaches the cast.
+    block:
+      var failed = false
+      try:
+        discard await writeSeekable(f, addr dummy, 1, low(int64), "writeAt")
+      except AsyncFileError:
+        failed = true
+      check failed
+
     f.close()
     removeFile(path)
 

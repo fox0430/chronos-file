@@ -21,6 +21,9 @@ import ../chronos_file
 import ../chronos_file/posix_handle # acquireOffsetGuard / releaseOffsetGuard
 import helpers
 
+when defined(chronosFileUring):
+  import ../chronos_file/uring_io # uringAvailable(): skip io_uring tests on fallback
+
 suite "chronos_file: seekable single-in-flight offset contract":
   teardown:
     checkLeaks()
@@ -229,6 +232,103 @@ suite "chronos_file: seekable single-in-flight offset contract":
 
     f.close()
     removeFile(path)
+
+  when defined(chronosFileUring):
+    asyncTest "a real in-flight seekable op rejects a concurrent one (io_uring)":
+      # With the io_uring seam suspending, two implicit-offset ops genuinely
+      # overlap — no white-box `seekOpInFlight` poking needed. The first holds the
+      # single offset slot across its CQE wait; a second implicit-offset op is
+      # rejected with AsyncFileBusyError, while an offset-independent positioned
+      # read proceeds.
+      if not uringAvailable():
+        skip() # backend compiled in but unusable here: ops complete synchronously
+        return
+      let path = tempPath(".bin")
+      let f = openAsync(path, fmReadWrite)
+      await f.write(@[byte 0, 1, 2, 3, 4, 5, 6, 7])
+      f.setFilePos(0)
+
+      let r1 = f.read(4) # runs synchronously up to the seam await: slot now held
+      check not r1.finished()
+      check f.seekOpInFlight
+      expect(AsyncFileBusyError):
+        discard await f.read(4) # concurrent implicit-offset op -> busy
+
+      # A positioned read touches no shared state and runs concurrently on the ring.
+      check (await f.readAt(4, 4)) == @[byte 4, 5, 6, 7]
+
+      # The first op still completes correctly and frees the slot.
+      check (await r1) == @[byte 0, 1, 2, 3]
+      check not f.seekOpInFlight
+
+      f.close()
+      removeFile(path)
+
+    asyncTest "append-mode writes stay off the io_uring drain set (carve-out)":
+      # Append has no io_uring write-at-end mode, so `writeSeekable` always takes
+      # the synchronous `write` tail for an `fmAppend` fd: the write completes
+      # inline (never suspends on the ring) and is never registered with
+      # `trackSeekFut`, so `closeWait`/`closeImpl` have nothing to drain for it.
+      # This locks that carve-out even with a usable ring present — if a later
+      # change routed append through io_uring, the write would suspend
+      # (`not finished()`) and this test would fail, forcing the author to confirm
+      # `trackSeekFut` is wired (else `closeWait` would miss the in-flight op). The
+      # companion `assert not f.appendMode` in `writeSeekable` guards the same
+      # invariant on the code side.
+      if not uringAvailable():
+        skip() # backend compiled in but unusable: every write is synchronous anyway
+        return
+      let path = tempPath(".log")
+      let f = openAsync(path, fmAppend)
+
+      let w = f.write(@[byte 1, 2, 3, 4])
+      check w.finished() # append is synchronous: no ring suspend...
+      check f.seekFuts.len == 0 # ...so nothing is tracked for closeWait to drain
+      await w
+
+      # A second append behaves identically; the drain set stays empty throughout.
+      let w2 = f.write(@[byte 5, 6, 7, 8])
+      check w2.finished()
+      check f.seekFuts.len == 0
+      await w2
+
+      await f.closeWait() # nothing to drain; succeeds with an empty seekFuts
+      check readFile(path) == "\x01\x02\x03\x04\x05\x06\x07\x08"
+      removeFile(path)
+
+    asyncTest "trackSeekFut swap-removes each settled op in O(1), keeping seekFuts consistent":
+      # `trackSeekFut`'s settle callback excises its own entry by the index the
+      # `SeekFut` carries — kept current as siblings swap-remove — instead of an
+      # O(n) identity scan, so settling N concurrent positioned ops is O(n), not
+      # O(n^2). This pins the index bookkeeping the optimisation introduced:
+      # completing many tracked ops in a scrambled order must leave `seekFuts`
+      # holding exactly the still-pending ops at every step (each entry's `idx`
+      # matching its own slot), and empty once all have settled — nothing lost,
+      # duplicated, or left dangling at a stale index. The bookkeeping is pure
+      # (no kernel op), so this runs even on the sync fallback — no ring needed.
+      let f = AsyncFile() # inert container: trackSeekFut only touches f.seekFuts
+      var futs: seq[Future[int]] = @[]
+      for i in 0 ..< 6:
+        let fut = newFuture[int]("test.trackSeekFut")
+        trackSeekFut(f, fut)
+        futs.add(fut)
+      check f.seekFuts.len == 6
+
+      # Settle out of order so a moved entry later removes itself by its *updated*
+      # idx — the exact path a naive fixed-index scheme would corrupt.
+      var settled = 0
+      for idx in [5, 2, 0, 4, 1, 3]:
+        futs[idx].complete(idx)
+        await sleepAsync(0.milliseconds) # let the settle callback run a poll
+        inc settled
+        # The live set is exactly the not-yet-settled ops...
+        check f.seekFuts.len == futs.len - settled
+        for s in f.seekFuts:
+          check not s.fut.finished() # no settled op lingers in the set
+        # ...and every entry's recorded index still points at its own slot.
+        for j in 0 ..< f.seekFuts.len:
+          check f.seekFuts[j].idx == j
+      check f.seekFuts.len == 0 # all drained, nothing lost or duplicated
 
   asyncTest "the offset guard is a no-op on non-seekable fds":
     let path = tempPath(".fifo")

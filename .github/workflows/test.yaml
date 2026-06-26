@@ -31,7 +31,6 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - 'ubuntu-latest'
           - 'macOS-latest'
         nim-version:
           - '2.0.16'
@@ -66,3 +65,39 @@ jobs:
     - name: Run unit test
       run: |
         nimble test -y
+
+  test-uring:
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        nim-version:
+          - '2.0.16'
+          - 'stable'
+          - 'devel'
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Cache nimble
+      uses: actions/cache@v5
+      with:
+        path: ~/.nimble
+        key: uring-tests-nimble-v1-${{ matrix.nim-version }}-${{ github.sha }}
+        restore-keys: |
+          uring-tests-nimble-v1-${{ matrix.nim-version }}-
+
+    - uses: jiro4989/setup-nim-action@v2
+      with:
+        nim-version: ${{ matrix.nim-version }}
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install iori
+      run: nimble install iori
+
+    - name: Run unit tests
+      run: nimble test -y
+
+    - name: Run io_uring unit tests
+      run: nimble testUring -y
