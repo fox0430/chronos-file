@@ -7,3 +7,5 @@ chronos_file/*
 
 tests/*
 !tests/*.*
+
+chronos_file.out
